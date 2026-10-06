@@ -120,7 +120,12 @@ pub(crate) fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
 /// [`Observation::scatter_action`] writes through it — so the two cannot disagree about
 /// where the policy's n-th value belongs.
 #[inline]
-const fn joint_of(slot: usize) -> usize {
+/// The 14 policy slots of the 15-joint vector: everything but the mouth.
+///
+/// `pub(crate)` because the policy loader needs the same map to place a model's own
+/// `default_joint_pos` (which is 14 values in `joint_names` order) onto our 15 joints. Two copies of
+/// this rule would be two chances to disagree with the actions they sit beside.
+pub(crate) const fn joint_of(slot: usize) -> usize {
     if slot < MOUTH_INDEX { slot } else { slot + 1 }
 }
 

@@ -1,0 +1,27 @@
+{
+  "imu_id": 200,
+  "imu_mount": [0.7071067811865476, 0.0, 0.7071067811865476, 0.0],
+  "baud_rate": 1000000,
+  "servo_pd": {
+    "kp": 6,
+    "kd": 20,
+    "mouth_kp": 10
+  },
+  "joints": [
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 },
+    { "zero_ticks": 2048, "direction": -1 }
+  ]
+}

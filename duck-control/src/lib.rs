@@ -16,6 +16,9 @@ pub mod obs;
 pub mod pickup;
 pub mod policy;
 pub mod safety;
+/// A FeeTech SCS/HLS bus: the 1910 servos and the `imu_to_dxl` node on one UART, instead of
+/// the Dynamixel bus [`bus`] speaks. See [`scs::ScsIo`] for why a robot picks one or the other.
+pub mod scs;
 /// A robot in MuJoCo, over TCP — the backend `robotd-design.md` §9 deferred.
 pub mod sim;
 

@@ -1067,6 +1067,19 @@ pub struct PolicyParams {
     /// `walk` (default) or `roller`. Changes which policies load *and* the tuning defaults
     /// below — every unset field resolves per mode, so a roller robot needs one line.
     pub mode: Mode,
+    /// Whether the walk/roller switch may happen *while running*. Off pins the robot to
+    /// [`Self::mode`] and refuses `robot.setMode`, which is what a robot whose other mode is not
+    /// ready wants: a switch loads a whole second set of networks and tuning, which is a lot of
+    /// robot to move because a pad was held a beat too long.
+    ///
+    /// **And this robot is exactly that case.** A set of roller policies was rehearsed here and
+    /// could not stand on rollers at all — on its back for every frame of two minutes, where the
+    /// shipped set stood — and no roller skates are fitted to the robot either. So the roller
+    /// half of that set is disabled at the daemon rather than left one mis-press away.
+    ///
+    /// Default true: switching is the prototype's behaviour, and `mode` in the file still chooses
+    /// what a reboot comes back in, which is the part that keeps working when this is off.
+    pub mode_switch: bool,
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
     /// release. The literal `"none"` disables a slot outright — the prototype's convention.
@@ -1963,6 +1976,7 @@ impl Default for PolicyParams {
         Self {
             enabled: true,
             mode: Mode::Walk,
+            mode_switch: true,
             walk: None,
             stand: None,
             sitstand: None,
@@ -2032,6 +2046,201 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// Whether the servos speak FeeTech SCS/HLS rather than Dynamixel protocol 2.0.
+    ///
+    /// `false` — what every shipped robot is — is the Dynamixel bus, so this one bit is the whole
+    /// statement that a robot is a different one. It is a protocol choice and not a
+    /// register-table one: the header, the checksum and the reply shape all differ, so the daemon
+    /// picks a different backend rather than a different table.
+    #[serde(default)]
+    pub scs: bool,
+    /// Where the FeeTech bus is described: its node id, mounting, gains, and the measured
+    /// encoder zero of each joint. See [`ScsConfig`].
+    ///
+    /// A file rather than a section because fifteen joints' worth of *measured* numbers is a
+    /// calibration, not a preference — it is written by a procedure with a robot hanging in it,
+    /// and a flat key/value editor that offers to retype one of those numbers is offering to
+    /// break the robot. Required when `scs` is set, and refused at the editor rather than at the
+    /// first tick.
+    #[serde(default)]
+    pub scs_config: Option<PathBuf>,
+}
+
+/// The FeeTech SCS/HLS bus, in its own file.
+///
+/// Everything here is a fact about *this* robot's bus rather than about the model: which id the
+/// `imu_to_dxl` node answers at, how it is mounted, which gains are written on every bring-up,
+/// and where each joint's encoder zero sits. Keeping it out of `robotd.toml` is deliberate —
+/// `robotd.toml` is what `robotctl configure` edits key by key, and none of these should be
+/// retyped by hand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScsConfig {
+    /// Bus id of the `imu_to_dxl` node.
+    ///
+    /// 200 is what the node ships as, which is also the address the Dynamixel backend reads it at,
+    /// so the two backends describe the same robot.
+    pub imu_id: u8,
+    /// Volatile position gains, written on every bring-up.
+    pub servo_pd: ScsServoPd,
+    /// Per-joint encoder zero and direction, in [`crate::board`] order — the same order as
+    /// `duck-ipc-proto::JOINT_NAMES`.
+    ///
+    /// A table rather than fifteen named keys so that "one joint is missing" is a parse-time
+    /// impossibility rather than a runtime nil, and because the order is the wire order: a
+    /// table read positionally cannot silently disagree with the state stream.
+    pub joints: Vec<ScsJoint>,
+    /// Sensor→trunk mounting rotation for the node's quaternion, scalar-first.
+    ///
+    /// **The default is the v2 board's mount, not the identity**, because the identity is a claim
+    /// that the sensor axes are the trunk axes and on this hardware they are not: the board sits
+    /// on the trunk rotated a quarter turn about Y. An omitted key would then report a duck
+    /// standing ninety degrees out of true, which is a wrong robot that looks like a working one —
+    /// the fall verdict flips, and every gravity-derived term in the observation is rotated.
+    ///
+    /// It is a *default* rather than a required key so that the common case is one line, and it is
+    /// spelled out here rather than referenced because this crate deliberately does not depend on
+    /// `duck-control` (the recovery path links it). [`crate::ScsConfig::default`] and
+    /// `duck_control::scs::Calibration::default` must therefore agree, and `robotd` — which depends
+    /// on both — asserts that they do.
+    pub imu_mount: [f64; 4],
+    /// Bus rate. 1 Mbps is what the servos' baud code and the node's are both set to; it is a
+    /// setting only because a bench bring-up may need to read a servo at another rate.
+    pub baud_rate: u32,
+}
+
+/// The volatile P/D written on every bring-up.
+///
+/// These are the *servo register* values, not the policy's `gain`. The policy's gain is an XL330
+/// figure (200 nominal, 50 limp) and is scaled onto this profile by the backend, so a gain change
+/// keeps its meaning without pretending the two servo families share a unit. The matching
+/// simulator constant is `kp_fw`, and the two must be changed together: a robot whose servos run
+/// at 6 while its policy was trained against 32 is a robot with a stiffness nobody chose.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScsServoPd {
+    pub kp: u8,
+    pub kd: u8,
+    /// The mouth is a lighter mechanism, and both forks that walk give it its own P.
+    pub mouth_kp: u8,
+}
+
+impl Default for ScsServoPd {
+    fn default() -> Self {
+        Self {
+            kp: 6,
+            kd: 20,
+            mouth_kp: 10,
+        }
+    }
+}
+
+/// One joint's mechanical zero, which way it turns, and nothing else.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScsJoint {
+    /// Raw encoder count when the joint sits at its mechanical zero.
+    ///
+    /// Measured, not assumed: the map is its own inverse, so it is the number a joint reads when
+    /// it is commanded to that same number. It is per-robot rather than per-model, which is why
+    /// it lives in `/etc/robot/robotd.toml` — a file an update does not touch.
+    pub zero_ticks: i32,
+    /// `+1` or `-1`: the sign that takes a raw count delta into the joint's positive direction.
+    pub direction: i8,
+}
+
+impl Default for ScsJoint {
+    fn default() -> Self {
+        Self {
+            zero_ticks: 2048,
+            direction: 1,
+        }
+    }
+}
+
+impl ScsConfig {
+    /// Read and check a bus description, so the gate is the same one `robotctl configure` runs
+    /// and a bad file is refused with a path and a reason rather than as a first tick that drives
+    /// a joint into its housing.
+    pub fn load(path: &Path) -> Result<Self, ParamsError> {
+        let raw = std::fs::read_to_string(path).map_err(|source| ParamsError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let config: Self = serde_json::from_str(&raw).map_err(|source| ParamsError::ScsParse {
+            path: path.display().to_string(),
+            source,
+        })?;
+        config.check(path)?;
+        Ok(config)
+    }
+
+    fn check(&self, path: &Path) -> Result<(), ParamsError> {
+        let fail = |why: String| ParamsError::Scs {
+            path: path.display().to_string(),
+            why,
+        };
+        if self.joints.len() != duck_ipc_proto::JOINT_IDS.len() {
+            return Err(fail(format!(
+                "needs {} joints, one per servo in wire order, got {} — a robot with no \
+                 calibration should say so rather than default to mid-travel zeros",
+                duck_ipc_proto::JOINT_IDS.len(),
+                self.joints.len()
+            )));
+        }
+        for (index, joint) in self.joints.iter().enumerate() {
+            if !matches!(joint.direction, -1 | 1) {
+                return Err(fail(format!(
+                    "joint {index} has direction {}, and only +1 or -1 drives a joint",
+                    joint.direction
+                )));
+            }
+            // A single turn is 0..4095 while the field is multi-turn, so a zero outside that is
+            // either another joint's zero or a wound encoder. Both are refused, because the
+            // position map would quietly reinterpret either one.
+            if !(0..4096).contains(&joint.zero_ticks) {
+                return Err(fail(format!(
+                    "joint {index} has zero_ticks {}, outside the single turn 0..4095",
+                    joint.zero_ticks
+                )));
+            }
+        }
+        if !(100_000..=1_000_000).contains(&self.baud_rate) {
+            return Err(fail(format!(
+                "baud_rate {} is outside the 100000..1000000 the servos and the node share",
+                self.baud_rate
+            )));
+        }
+        // A node addressed as a joint would answer the joint's slot, and the two devices would
+        // share one block.
+        if self.imu_id > 253 || duck_ipc_proto::JOINT_IDS.contains(&self.imu_id) {
+            return Err(fail(format!(
+                "imu_id {} is either outside the 0..253 the protocol addresses or is one of the \
+                 fifteen joint ids",
+                self.imu_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ScsConfig {
+    fn default() -> Self {
+        Self {
+            imu_id: 200,
+            servo_pd: ScsServoPd::default(),
+            // Empty rather than a fabricated table: a robot with no calibration should be told to
+            // measure one, not handed fifteen mid-travel zeros that look like an answer.
+            joints: Vec::new(),
+            imu_mount: [
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ],
+            baud_rate: 1_000_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2102,6 +2311,8 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            scs: false,
+            scs_config: None,
         }
     }
 }
@@ -2177,6 +2388,14 @@ pub enum ParamsError {
         path: String,
         pause: f32,
         resume: f32,
+    },
+    #[error("{path}: bus.scs {why}")]
+    Scs { path: String, why: String },
+    #[error("parsing FeeTech bus description {path}: {source}")]
+    ScsParse {
+        path: String,
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -2288,6 +2507,42 @@ impl Params {
                 pause,
                 resume,
             });
+        }
+        // The switch and the file have to agree, and the file has to be readable *here*: this is
+        // the gate `robotctl configure` runs, and a robot whose calibration is wrong is a robot
+        // that has not been calibrated. Saying so in the editor is the difference between a
+        // refused write and a first tick that drives a joint into its housing.
+        match (self.bus.scs, &self.bus.scs_config) {
+            (true, None) => {
+                return Err(ParamsError::Scs {
+                    path: path.display().to_string(),
+                    why: "is on, so bus.scs_config must name the file describing the bus — see \
+                          scripts/ for the calibration procedure"
+                        .to_owned(),
+                });
+            }
+            (false, Some(config)) => {
+                return Err(ParamsError::Scs {
+                    path: config.display().to_string(),
+                    why: "is configured while bus.scs is off, so the Dynamixel backend would read \
+                          the port and ignore it"
+                        .to_owned(),
+                });
+            }
+            (true, Some(config)) => {
+                // Paths in this file are absolute — it is read by a systemd unit whose working
+                // directory is `/`, so a relative one would resolve to somewhere nobody meant.
+                if !config.is_absolute() {
+                    return Err(ParamsError::Scs {
+                        path: config.display().to_string(),
+                        why: "must be an absolute path: this file is read with `/` as the \
+                              working directory"
+                            .to_owned(),
+                    });
+                }
+                ScsConfig::load(config)?;
+            }
+            (false, None) => {}
         }
         Ok(())
     }
@@ -3461,6 +3716,128 @@ mod tests {
             ..pickup
         };
         assert_eq!(none.model_resolved(), None);
+    }
+
+    /// A FeeTech bus description with `count` joints, for the gate tests below.
+    fn scs_json(count: usize, direction: i8, zero_ticks: i32, imu_id: u8) -> String {
+        let joints: Vec<String> = (0..count)
+            .map(|_| format!("{{\"zero_ticks\":{zero_ticks},\"direction\":{direction}}}"))
+            .collect();
+        format!("{{\"imu_id\":{imu_id},\"joints\":[{}]}}", joints.join(","))
+    }
+
+    /// The switch and the file are two halves of one statement, and each is useless alone: a bus
+    /// declared FeeTech with no calibration is a robot whose first tick drives a joint into its
+    /// housing, and a calibration with the switch off is a file the Dynamixel backend would
+    /// silently ignore while reading the same port.
+    #[test]
+    fn the_feechtech_switch_and_its_calibration_must_agree() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = write(dir.path(), "[bus]\nscs = true\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("scs_config"), "{error}");
+
+        let config = dir.path().join("scs.json");
+        std::fs::write(&config, scs_json(15, 1, 2048, 200)).unwrap();
+        let path = write(
+            dir.path(),
+            &format!("[bus]\nscs_config = {:?}\n", config.display().to_string()),
+        );
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("bus.scs is off"), "{error}");
+
+        // Both, and absolute, and fifteen joints: accepted.
+        let path = write(
+            dir.path(),
+            &format!(
+                "[bus]\nscs = true\nscs_config = {:?}\n",
+                config.display().to_string()
+            ),
+        );
+        let params = Params::load(&path, true).expect("valid");
+        assert!(params.bus.scs);
+        assert_eq!(params.bus.scs_config.as_deref(), Some(config.as_path()));
+    }
+
+    /// The example bus description the repo ships must itself be loadable, or it is a trap: it is
+    /// the file an operator copies to the robot, and `deny_unknown_fields` means one stray key
+    /// makes it unusable rather than ignored.
+    #[test]
+    fn the_shipped_scs_example_is_a_valid_bus_description() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("robotd-params/ has a parent");
+        let config =
+            ScsConfig::load(&root.join("deploy/scs.example.json")).expect("the example must load");
+        assert_eq!(config.joints.len(), duck_ipc_proto::JOINT_IDS.len());
+        assert_eq!(
+            config.imu_id, 200,
+            "the node answers where the Dynamixel side reads it"
+        );
+        // Every servo was CAL'd to read 2048 at its rest pose, and the sign is one global -1 from
+        // the hand measurements — see docs/design/scs-bus.md. Asserted so a careless edit to the
+        // example is a test failure rather than a robot that walks backwards.
+        assert!(config.joints.iter().all(|j| j.zero_ticks == 2048));
+        assert!(config.joints.iter().all(|j| j.direction == -1));
+        assert_eq!(config.servo_pd.kp, 6);
+    }
+
+    /// A relative path would resolve against whatever the unit's working directory happens to be.
+    #[test]
+    fn a_relative_feechtech_calibration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scs.json"), scs_json(15, 1, 2048, 200)).unwrap();
+        let path = write(dir.path(), "[bus]\nscs = true\nscs_config = \"scs.json\"\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("absolute"), "{error}");
+    }
+
+    /// Every one of these is a calibration that cannot describe a robot, and each is refused at
+    /// the editor rather than as a joint that walks backwards or a zero that is another joint's.
+    #[test]
+    fn a_calibration_that_cannot_describe_a_robot_is_refused() {
+        let cases: Vec<(&str, String)> = vec![
+            ("joints", scs_json(14, 1, 2048, 200)),
+            ("direction", scs_json(15, 0, 2048, 200)),
+            ("zero_ticks", scs_json(15, 1, 5000, 200)),
+            ("imu_id", scs_json(15, 1, 2048, 10)),
+            ("baud_rate", "{\"baud_rate\":9600,\"joints\":[]}".to_owned()),
+        ];
+        for (label, json) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("scs.json");
+            std::fs::write(&config, &json).unwrap();
+            let path = write(
+                dir.path(),
+                &format!(
+                    "[bus]\nscs = true\nscs_config = {:?}\n",
+                    config.display().to_string()
+                ),
+            );
+            let error = Params::load(&path, true).expect_err(label).to_string();
+            assert!(
+                error.contains("bus.scs") || error.contains("FeeTech"),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    /// The shipped robot is a Dynamixel one, and adding a second backend must not have changed
+    /// anything about it — not the default, not the registry, not a config that never mentions
+    /// either key.
+    #[test]
+    fn a_config_that_never_mentions_feechtech_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[bus]\nport = \"/dev/ttyS2\"\n");
+        let params = Params::load(&path, true).expect("valid");
+        assert!(!params.bus.scs);
+        assert!(params.bus.scs_config.is_none());
+
+        let default = Params::default();
+        assert!(!default.bus.scs);
+        assert!(default.bus.scs_config.is_none());
+        assert!(default.bus.fast_sync_read);
     }
 
     /// The two thresholds are a hysteresis band. Inverted, the latch would pause and resume on

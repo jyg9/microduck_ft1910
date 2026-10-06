@@ -447,6 +447,27 @@ reject the majority of it. And the numbers it is checked against are published i
 `duck_ipc_proto` rather than duplicated, with a compile-time assertion in `duck_control` that the
 two agree — a contract with whoever publishes a policy belongs where both sides can see it.
 
+**A policy also says which pose it was trained around, and this daemon believes it.** Beside the
+manifest, and read from a different place: the graph carries `default_joint_pos` and `joint_names`
+as ONNX metadata. The shipped and retrained sets record the same numbers the daemon has compiled
+into `DEFAULT_POSITION` — to three decimals, so they agree to 0.0003 rad and reading them changes
+nothing — which is exactly why the assumption survived unnoticed until a set trained around a
+different stance arrived: the xgoduck reference policies are 0.109 rad (6.2°) shallower at the hip
+and ankle.
+
+Reading it matters twice over, and the second half is the one that is easy to miss. The stance is
+the base an action's offsets are added to, **and** it is what the observation's `joint_pos` block
+is measured from. Assuming the built-in pose would therefore both stand the robot somewhere the
+network never saw and tell that network it was 6° below its own default — one is a state the
+policy has seen, the other is a robot it cannot recognise.
+
+Unlike the manifest, this is a reason to *check* rather than only to refuse. The joint order is
+verified against ours before the numbers are placed, because the numbers carry no names and a
+differently-ordered list would otherwise be believed silently, one joint at a time. A missing
+field is not an error — a model that predates it keeps the built-in home — but a field that is
+present and unusable is refused by name, along with any angle outside the ±π the joints travel.
+`robotctl`-visible evidence is one journal field: `policy loaded ... home_hip_pitch=-0.349`.
+
 **A slot can be switched off**, with `none` — the literal `[policy] <slot> = "none"` already
 used. Every slot but `walk`, which is what the others fall back to and so cannot be empty; asking
 is refused, and a config that already says it is repaired at startup and reported degraded. Not an afterthought: the first community policy anyone will try does its own two-foot

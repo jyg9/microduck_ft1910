@@ -43,6 +43,12 @@ the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip 
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
 
+The protocol above is Dynamixel v2, which is what a shipped robot speaks. A robot whose fifteen
+servos speak FeeTech SCS/HLS instead says so in `[bus] scs`, and everything about that bus — the
+fifteen-byte block its node shares with the servos, the calibration file, the volatile P/D and why
+energising is ordered — is [`scs-bus.md`](scs-bus.md)'s. This page owns the Dynamixel one; the seam
+between them, [`io::RobotIo`], is §2.1 and is the same for both.
+
 **One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
 motor control needs the character devices, and root is not stopped by that flag. The daemon

@@ -40,6 +40,24 @@ port = "/dev/ttyS2"
 # this line. Needs a robotd restart.
 # fast_sync_read = true
 
+# Whether the servos speak FeeTech SCS/HLS rather than Dynamixel protocol 2.0. The 1910 robot
+# is the FeeTech one; leave both lines alone and the daemon opens the Dynamixel bus it always
+# did. This is a protocol choice rather than a register-table one — different header, a
+# one's-complement checksum instead of a CRC, and a status packet per device instead of one
+# appended to a broadcast — so it selects a different backend, not a different table. Needs a
+# robotd restart.
+#
+# The companion file is neither a preference nor something to retype: it holds fifteen
+# *measured* encoder zeros, each the reading of a joint standing at its own mechanical zero,
+# plus the volatile P/D written on every bring-up. Two things about it are worth knowing
+# before editing it. A wrong zero is a joint that goes somewhere other than where the policy
+# says. And the P/D there must match the `kp_fw` its policies were trained against: a robot
+# running 6 while the simulator was told 32 has a stiffness nobody chose, and it will not look
+# like a config error from the outside.
+#
+# scs = true
+# scs_config = "/etc/robot/scs.json"
+
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
 # /etc/robot/robotd.toml once and never overwrites it, so an uncommented value is frozen on
@@ -127,6 +145,17 @@ enabled = true
 # trained low-pass. Only the standing network stays out: the prototype loads it in roller
 # mode and then never runs it, standing transitions being skipped on wheels.
 mode = "walk"
+
+# Whether the walk/roller switch may happen *while running* — the pad's held D-pad up, or
+# `robot.setMode`. Off pins the robot to the mode above (which `robotctl configure --set
+# policy.mode=roller` still changes, for the next start) and refuses the live switch.
+#
+# A switch is a lot of robot to move because a pad was held a beat too long: it goes home,
+# loads a whole second set of networks and tuning, and the robot stands through the swap. This
+# robot has no roller skates fitted, and the retrained roller set that was rehearsed for it
+# could not stand on rollers at all — on its back for every frame of two minutes, where the
+# shipped set stood. So the roller half is disabled here rather than left one mis-press away.
+# mode_switch = false
 
 # Policy files. Unset means the mode's default in /opt/robot/policies/current, which is
 # deliberately *outside* the release: a gait retrain should not need a daemon release, and a

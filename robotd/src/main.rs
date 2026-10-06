@@ -39,6 +39,7 @@ use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
+use duck_control::policy::Net;
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyError, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
 use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
@@ -612,6 +613,9 @@ struct RobotState {
     /// would be told about a robot that does not exist. Swapped by the control loop, which is
     /// the only thing that loads a policy.
     policies: ArcSwap<PolicyNames>,
+    /// Whether the live walk/roller switch is allowed, read once at startup like the policies:
+    /// it is a fact about which networks this robot has, not a per-request decision.
+    mode_switch: bool,
     /// The per-slot report `robot.policies` serves — paths, origins, and any slot whose override
     /// could not be loaded.
     ///
@@ -719,6 +723,7 @@ impl RobotState {
             policy_error: ArcSwapOption::empty(),
             policy_change_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+            mode_switch: params.policy.mode_switch,
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
                 &params.policy.resolved(),
@@ -1078,6 +1083,13 @@ async fn main() -> ExitCode {
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
 fn run_init(params: &Params, duration: Duration) -> ExitCode {
+    // A different bus is a different bring-up order, not merely a different driver — see
+    // `run_scs_init` — so the choice is made before anything is energised rather than inside the
+    // ramp.
+    #[cfg(target_os = "linux")]
+    if params.bus.scs {
+        return run_scs_init(params, duration);
+    }
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
@@ -1099,6 +1111,53 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // robot is standing up unsupported.
     if let Err(e) = io.set_gain(params.policy.gain) {
         tracing::error!(error = %e, gain = params.policy.gain, "cannot set the position gain");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
+        tracing::error!(error = %e, "interpolation to the home pose failed");
+        return ExitCode::FAILURE;
+    }
+    tracing::warn!(?duration, "at home pose, torque enabled");
+    ExitCode::SUCCESS
+}
+
+/// `init` on a FeeTech bus.
+///
+/// Two things are ordered differently from the Dynamixel path, and both for the same reason: on
+/// this backend the *gains* are volatile RAM that a reboot resets, so they are written before
+/// anything is energised, and torque is enabled by a bring-up that first writes the pose the
+/// robot is already in. Energising first and stiffening afterwards — which is what the Dynamixel
+/// order does and why — would be refused here, because stiffening a servo that is already holding
+/// a pose against load is the one gain change that moves the robot by itself.
+#[cfg(target_os = "linux")]
+fn run_scs_init(params: &Params, duration: Duration) -> ExitCode {
+    let Some(config_path) = &params.bus.scs_config else {
+        tracing::error!("bus.scs is on with no bus.scs_config; nothing to open");
+        return ExitCode::FAILURE;
+    };
+    let config = match params::ScsConfig::load(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read the FeeTech bus description");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut io = match duck_control::scs::ScsIo::open(&params.bus.port, scs_calibration(&config)) {
+        Ok(io) => io,
+        Err(e) => {
+            tracing::error!(error = %e, port = %params.bus.port, "cannot open the FeeTech bus");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The same reasoning as the Dynamixel path's placement of this call, arrived at from the
+    // other end: a previous fall leaves the volatile gain soft, and the ramp is the one moment
+    // the robot stands up unsupported. Before torque, so the write is allowed.
+    if let Err(e) = io.set_gain(params.policy.gain) {
+        tracing::error!(error = %e, gain = params.policy.gain, "cannot set the servo gain");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = io.set_torque(true) {
+        tracing::error!(error = %e, "cannot enable torque");
         return ExitCode::FAILURE;
     }
     if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
@@ -1196,6 +1255,52 @@ fn spawn_control_thread(
                 // The voice works while the bus does not: a robot waiting on unplugged servos
                 // still quacks. Stopped before the loop starts, which then owns the speaker.
                 let waiting_voice = WaitingVoice::start(&params, Arc::clone(&intents));
+                // FeeTech first, and only when the config says so: `[bus] scs` is the whole
+                // statement that this robot is not a Dynamixel one, and a config that never
+                // mentions it takes exactly the path it always did.
+                #[cfg(target_os = "linux")]
+                if bus.scs {
+                    let config = match &bus.scs_config {
+                        // `Params::load` already refused this combination, so reaching it means
+                        // the file was accepted and then the bus section was edited underneath a
+                        // running daemon. Refusing to open beats opening on a guess.
+                        Some(config) => config.clone(),
+                        None => {
+                            tracing::error!(
+                                "bus.scs is on with no bus.scs_config; not opening the bus"
+                            );
+                            drop(waiting_voice);
+                            return;
+                        }
+                    };
+                    match params::ScsConfig::load(&config) {
+                        Ok(config) => {
+                            let io = open_scs_waiting(&bus.port, &config, &state).await;
+                            drop(waiting_voice);
+                            if let Some(io) = io {
+                                control_loop(
+                                    io,
+                                    state,
+                                    intents,
+                                    params,
+                                    params_path,
+                                    period,
+                                    poweroff,
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            // Named here as well as at the editor, because this is where it is
+                            // acted on: a robot whose calibration does not load is a robot that
+                            // must not be driven.
+                            tracing::error!(error = %e, "cannot read the FeeTech bus description");
+                            drop(waiting_voice);
+                        }
+                    }
+                    return;
+                }
+
                 let io = open_bus_waiting(&bus, &state).await;
                 drop(waiting_voice);
                 if let Some(io) = io {
@@ -1308,6 +1413,88 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
     }
 
     None
+}
+
+/// Open the FeeTech bus, waiting for the servos and the node to answer.
+///
+/// The same shape as [`open_bus_waiting`] and for the same reason: an unpowered board is a
+/// condition someone fixes by flipping a switch, not one to abandon the control loop over. What
+/// is deliberately absent is the servo-adoption path — a FeeTech robot's missing servo is a
+/// calibration and a re-provision, not a firmware flash this daemon can do over the bus.
+#[cfg(target_os = "linux")]
+async fn open_scs_waiting(
+    port: &str,
+    config: &params::ScsConfig,
+    state: &RobotState,
+) -> Option<duck_control::scs::ScsIo> {
+    let calibration = scs_calibration(config);
+    let mut attempt = 0u32;
+
+    while !state.shutdown.load(Ordering::Relaxed) {
+        // The same `loud` rule as the Dynamixel path: chatty on the first attempt, then about
+        // one line per thirty seconds, so a board waiting overnight does not fill the journal.
+        let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+        match duck_control::scs::ScsIo::open(port, calibration.clone()) {
+            Ok(io) => {
+                state.startup_bus_failures.store(0, Ordering::Relaxed);
+                state.startup_missing.store(Arc::new(Vec::new()));
+                tracing::info!(
+                    port,
+                    baud_rate = config.baud_rate,
+                    imu_id = config.imu_id,
+                    "FeeTech bus open"
+                );
+                return Some(io);
+            }
+            Err(e) => {
+                if loud {
+                    tracing::error!(
+                        error = %e,
+                        port,
+                        attempt,
+                        "cannot open the FeeTech bus; waiting, is servo power on?"
+                    );
+                }
+            }
+        }
+        attempt += 1;
+        state.startup_bus_failures.store(attempt, Ordering::Relaxed);
+        tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
+    }
+
+    None
+}
+
+/// Turn the bus description into what the backend wants.
+///
+/// Two shapes rather than one because `robotd-params` is a pure crate — no serial port, no ONNX
+/// Runtime in its tree, because the recovery path links it — so the calibration schema cannot be
+/// `duck-control`'s. One conversion function is where the field-by-field agreement lives, which
+/// is better than two structs kept in step by hand.
+#[cfg(target_os = "linux")]
+fn scs_calibration(config: &params::ScsConfig) -> duck_control::scs::Calibration {
+    use duck_control::scs::{Calibration, JointCalibration, PdProfile};
+
+    Calibration {
+        imu_id: config.imu_id,
+        // The schema guarantees one entry per servo in wire order; indexing rather than zipping
+        // is what makes a length mismatch a panic in a test instead of fifteen defaulted joints
+        // on a robot.
+        joints: std::array::from_fn(|joint| JointCalibration {
+            zero_ticks: config.joints[joint].zero_ticks,
+            direction: f64::from(config.joints[joint].direction),
+            // Overwritten by the servo's own window when the bus opens. The widest window a
+            // single turn can have is the safe direction to be wrong in for the moment before.
+            limits: (0, 4095),
+        }),
+        pd: PdProfile {
+            kp: config.servo_pd.kp,
+            kd: config.servo_pd.kd,
+            mouth_kp: config.servo_pd.mouth_kp,
+        },
+        imu_mount: config.imu_mount,
+        baud_rate: config.baud_rate,
+    }
 }
 
 /// Open and verify the bus, or explain why not.
@@ -1800,8 +1987,17 @@ fn try_controller(
                 if policy_cfg.mode == Mode::Roller {
                     policy.set_standing_disabled(true);
                 }
+                // The stance the walking network's actions are centred on, logged because it is the
+                // one thing about a loaded set that is invisible from the outside: a model carries
+                // its own `default_joint_pos` and this daemon now believes it, so "did this set's
+                // home take effect" has an answer in the journal instead of in a hex editor.
+                // `left_hip_pitch` names it because it is the joint the reference sets disagree
+                // about most (-0.458 built in, -0.349 in the xgoduck set).
+                let walk_home = policy.home_pose(Net::Walk);
                 tracing::warn!(
                     mode = policy_cfg.mode.as_str(),
+                    home_hip_pitch = walk_home[duck_control::model::joint_index("left_hip_pitch")
+                        .expect("left_hip_pitch is a joint")],
                     walk = %policy_cfg.walk.display(),
                     stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
                     sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
@@ -2443,7 +2639,18 @@ async fn control_loop<T: RobotIo>(
         // throughout — the robot holds itself up across the swap rather than sitting down.
         if let Some(code) = intents.take_mode_switch() {
             let target = mode_of(code);
-            if target == policy_params.mode {
+            if !params.policy.mode_switch {
+                // The backstop for the refusal `robot.setMode` gives at the IPC boundary. Here
+                // because the intent is a channel, not a call: anything holding `Intents` can
+                // queue one, and a switch moves the robot and loads a second set of networks for
+                // whoever asked. `policy.mode_switch = false` is the robot saying "not on this
+                // one" — see the field's doc for why a robot would.
+                tracing::warn!(
+                    mode = target.as_str(),
+                    from = policy_params.mode.as_str(),
+                    "mode switch refused: policy.mode_switch = false"
+                );
+            } else if target == policy_params.mode {
                 tracing::info!(
                     mode = target.as_str(),
                     "already in that mode; nothing to switch"
@@ -4903,6 +5110,12 @@ fn dispatch(
             };
             let result = match target {
                 None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
+                // Refused before the "is there anything to switch to" question, because the
+                // answer is the same either way and this is the reason: the robot is saying it
+                // has no second mode it can be trusted in. See the field's doc.
+                Some(_) if !state.mode_switch => proto::IntentResult::refused(
+                    "mode switching is off on this robot ([policy] mode_switch = false)",
+                ),
                 Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
                     "no policy on this robot, so there is nothing to switch between",
                 ),
@@ -5904,6 +6117,51 @@ mod tests {
         assert!(s.health().healthy);
     }
 
+    /// The two layers that both describe an SCS bus must agree about the sensor mounting.
+    ///
+    /// `robotd-params` cannot name `duck_control::scs::Calibration::DEFAULT_MOUNT` — it does not
+    /// depend on that crate, deliberately, because the recovery path links it — so the same number
+    /// is written down twice. This is the test that makes the duplication safe, because the failure
+    /// it prevents is silent: a config that omits `imu_mount` would get one value while the bus
+    /// layer believed another, and a duck standing at ninety degrees reports as fallen rather than
+    /// as misconfigured.
+    #[test]
+    fn the_two_layers_agree_about_the_default_imu_mount() {
+        assert_eq!(
+            params::ScsConfig::default().imu_mount,
+            duck_control::scs::Calibration::default().imu_mount
+        );
+        assert_ne!(
+            params::ScsConfig::default().imu_mount,
+            [1.0, 0.0, 0.0, 0.0],
+            "and it must not be the identity, which is a claim about this hardware that is false"
+        );
+        // The fields either side of it, for the same reason: these are hardware facts written down
+        // twice, and `imu_id` is the one the whole shared-block design rests on.
+        assert_eq!(params::ScsConfig::default().imu_id, 200);
+        assert_eq!(
+            params::ScsConfig::default().imu_id,
+            duck_control::scs::Calibration::default().imu_id
+        );
+    }
+
+    /// `robot.setMode` against a given state, as the dispatch arm sees it.
+    fn set_on(state: &RobotState, intents: &Intents, mode: &str) -> proto::IntentResult {
+        dispatch(
+            state,
+            intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotSetMode(proto::SetModeParams {
+                mode: mode.to_owned(),
+            }),
+        )
+        .result
+        .expect("a result")
+        .as_object()
+        .map(|o| serde_json::from_value(serde_json::Value::Object(o.clone())).expect("shape"))
+        .expect("an object")
+    }
+
     /// **The point of slice 1.** A loop that ticked once and then wedged must report
     /// unhealthy, not stay healthy forever on the strength of that one tick. This is what
     /// the updater's auto-rollback actually gates on.
@@ -5923,22 +6181,7 @@ mod tests {
             false,
         );
         let intents = Arc::new(Intents::new());
-        let id = || proto::Id::Number(1);
-        let set = |mode: &str| -> proto::IntentResult {
-            dispatch(
-                &s,
-                &intents,
-                id(),
-                &proto::Call::RobotSetMode(proto::SetModeParams {
-                    mode: mode.to_owned(),
-                }),
-            )
-            .result
-            .expect("a result")
-            .as_object()
-            .map(|o| serde_json::from_value(serde_json::Value::Object(o.clone())).expect("shape"))
-            .expect("an object")
-        };
+        let set = |mode: &str| set_on(&s, &intents, mode);
 
         // Default params name a walking bundle, so there is something to switch between.
         assert!(set("roller").accepted, "a real mode is accepted");
@@ -5965,6 +6208,27 @@ mod tests {
             "a refused switch must not reach the loop"
         );
 
+        // A robot whose second mode is not trusted to run. The refusal has to name the key, or
+        // whoever reads it on a pad that stopped switching has nowhere to look — and it has to
+        // come *before* the "nothing to switch between" check, because the reason is the robot
+        // saying so rather than an absence of networks.
+        let mut pinned = Params::default();
+        pinned.policy.mode_switch = false;
+        let pinned = RobotState::new(&pinned, std::path::Path::new("/tmp/x.toml"), false, false);
+        let intents = Arc::new(Intents::new());
+        assert!(
+            pinned.policies.load().walk.is_some(),
+            "the fixture has policies"
+        );
+        let refused = set_on(&pinned, &intents, "roller");
+        assert!(!refused.accepted);
+        let reason = refused.reason.unwrap_or_default();
+        assert!(reason.contains("mode_switch"), "{reason}");
+        assert!(
+            intents.take_mode_switch().is_none(),
+            "a pinned robot must not queue a switch either"
+        );
+
         // A robot with no policy at all: nothing to switch between, and saying so beats homing
         // the robot for a swap that would load nothing.
         let mut bare = Params::default();
@@ -5975,16 +6239,7 @@ mod tests {
             false,
             false,
         );
-        let response = dispatch(
-            &s,
-            &intents,
-            id(),
-            &proto::Call::RobotSetMode(proto::SetModeParams {
-                mode: "roller".to_owned(),
-            }),
-        );
-        let result: proto::IntentResult =
-            serde_json::from_value(response.result.expect("a result")).expect("shape");
+        let result = set_on(&s, &intents, "roller");
         assert!(!result.accepted);
         assert!(
             result.reason.unwrap_or_default().contains("no policy"),

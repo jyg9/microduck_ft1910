@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::model::{DEFAULT_POSITION, NUM_JOINTS};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::tensor::TensorElementType;
@@ -58,6 +59,16 @@ pub enum PolicyError {
         expected: String,
         got: String,
     },
+    /// A field the model carries about itself, and cannot be believed.
+    ///
+    /// Separate from [`Self::Shape`] because the graph is fine — this is the *provenance* the
+    /// export wrote beside it, and the fix is a re-export rather than a different build.
+    #[error("{path}: {field} {why}")]
+    Metadata {
+        path: PathBuf,
+        field: &'static str,
+        why: String,
+    },
     #[error("inference failed: {0}")]
     Inference(String),
     /// ONNX Runtime is not installed, or not where it is being looked for.
@@ -77,14 +88,15 @@ pub enum PolicyError {
 impl PolicyError {
     /// The file this error is about, when it is about one.
     ///
-    /// `Read`, `Load` and `Shape` name a file; a missing runtime or an `ort` panic does not, and
-    /// blaming whichever policy happened to be loading when the dylib turned out to be absent
-    /// would send an operator to replace a file that is fine.
+    /// `Read`, `Load`, `Shape` and `Metadata` name a file; a missing runtime or an `ort` panic does
+    /// not, and blaming whichever policy happened to be loading when the dylib turned out to be
+    /// absent would send an operator to replace a file that is fine.
     pub fn path(&self) -> Option<&Path> {
         match self {
             PolicyError::Read { path, .. }
             | PolicyError::Load { path, .. }
-            | PolicyError::Shape { path, .. } => Some(path),
+            | PolicyError::Shape { path, .. }
+            | PolicyError::Metadata { path, .. } => Some(path),
             PolicyError::Inference(_)
             | PolicyError::RuntimeMissing { .. }
             | PolicyError::RuntimePanic { .. } => None,
@@ -335,6 +347,37 @@ impl Policy {
     /// One inference on the named network. A missing optional network falls back to
     /// walking — the scheduler checks `has_*` before asking, so reaching the fallback is a
     /// bug, but a wrong gait beats a dead control thread.
+    /// Which network a request actually runs on.
+    ///
+    /// One place, because two callers need the answer and they must not differ: [`Self::infer`]
+    /// runs the network, and [`Self::home_pose`] says which pose its actions are centred on. A
+    /// fallback resolved in one and not the other would take the action from one model and the pose
+    /// from another.
+    fn resolve(&self, net: Net) -> Net {
+        match net {
+            Net::Stand if self.stand.is_none() => Net::Walk,
+            Net::SitStand if self.sitstand.is_none() => Net::Walk,
+            Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
+            Net::Skill(i) if i >= self.skills.len() => Net::Walk,
+            net => net,
+        }
+    }
+
+    /// The pose the next action will be centred on, for the network `net` resolves to.
+    ///
+    /// The caller needs this *before* [`Self::infer`], because the observation's `joint_pos` block
+    /// is measured from it and is an argument to that call.
+    pub fn home_pose(&self, net: Net) -> [f64; NUM_JOINTS] {
+        match self.resolve(net) {
+            Net::Stand => self.stand.as_ref().unwrap_or(&self.walk),
+            Net::SitStand => self.sitstand.as_ref().unwrap_or(&self.walk),
+            Net::GroundPick => self.ground_pick.as_ref().unwrap_or(&self.walk),
+            Net::Skill(i) => self.skills.get(i).unwrap_or(&self.walk),
+            Net::Walk => &self.walk,
+        }
+        .home_pose
+    }
+
     pub fn infer(
         &mut self,
         observation: &Observation,
@@ -342,13 +385,7 @@ impl Policy {
     ) -> Result<[f32; ACTION_LEN], PolicyError> {
         // Resolve fallback before comparing: asking for an absent skill must not reset
         // the walking network on every tick.
-        let net = match net {
-            Net::Stand if self.stand.is_none() => Net::Walk,
-            Net::SitStand if self.sitstand.is_none() => Net::Walk,
-            Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
-            Net::Skill(i) if i >= self.skills.len() => Net::Walk,
-            net => net,
-        };
+        let net = self.resolve(net);
         let changed = self.active != Some(net);
         let network = match net {
             Net::Walk => &mut self.walk,
@@ -462,6 +499,9 @@ struct Network {
     action_name: String,
     path: PathBuf,
     digest: [u8; 32],
+    /// The pose this model's actions are centred on, and the pose its observation's `joint_pos`
+    /// block is measured from. See [`parse_home_pose`].
+    home_pose: [f64; NUM_JOINTS],
 }
 
 struct LstmState {
@@ -585,6 +625,102 @@ fn check_matrix(path: &Path, outlet: &ort::value::Outlet, width: usize) -> Resul
     Ok(())
 }
 
+/// The pose a policy's actions are centred on, out of the model's own metadata.
+///
+/// **Why this is read rather than assumed.** Upstream bakes the home pose into [`DEFAULT_POSITION`]
+/// and records the same numbers in this metadata for provenance, so for the official and retrained
+/// sets the two agree and nothing here is visible. A model trained against a different stance — the
+/// xgoduck reference set is 0.109 rad shallower at the hip and ankle — would otherwise be run
+/// centred on a pose it never saw, and **both** halves of that matter: the observation's `joint_pos`
+/// block is measured from the same pose, so the network would be told "I am six degrees below my
+/// default" *and* have its offsets added to the wrong base. One is a state it has seen; the other
+/// is a robot standing somewhere the policy never trained for.
+///
+/// Absent is not an error — a model that predates the field keeps the built-in home, which is what
+/// every shipped set does — and the remaining joints come from [`DEFAULT_POSITION`] because the
+/// mouth is not a policy joint.
+///
+/// Present-but-unusable *is* an error. The alternative to refusing is standing the robot up
+/// wherever a malformed string happened to point.
+fn parse_home_pose(
+    path: &Path,
+    pose: Option<&str>,
+    joints: Option<&str>,
+) -> Result<[f64; NUM_JOINTS], PolicyError> {
+    let Some(pose) = pose else {
+        return Ok(DEFAULT_POSITION);
+    };
+    let refuse = |field: &'static str, why: String| PolicyError::Metadata {
+        path: path.to_owned(),
+        field,
+        why,
+    };
+
+    // The order has to be checked before the numbers are placed, because the numbers carry no
+    // names: a model whose joints are listed differently would be believed, silently, and every
+    // joint after the first difference would be commanded someone else's pose.
+    let expected: Vec<&str> = (0..ACTION_LEN)
+        .map(|slot| duck_ipc_proto::JOINT_NAMES[crate::obs::joint_of(slot)])
+        .collect();
+    let Some(joints) = joints else {
+        return Err(refuse(
+            "joint_names",
+            format!(
+                "is missing, so the order of `default_joint_pos` cannot be checked against {}",
+                expected.join(",")
+            ),
+        ));
+    };
+    let got: Vec<&str> = joints.split(',').map(str::trim).collect();
+    if got != expected {
+        return Err(refuse(
+            "joint_names",
+            format!("is {}, expected {}", got.join(","), expected.join(",")),
+        ));
+    }
+
+    let values: Vec<f64> = match pose
+        .split(',')
+        .map(|v| v.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+    {
+        Ok(values) => values,
+        Err(e) => {
+            return Err(refuse(
+                "default_joint_pos",
+                format!("is not a list of numbers: {e}"),
+            ));
+        }
+    };
+    if values.len() != ACTION_LEN {
+        return Err(refuse(
+            "default_joint_pos",
+            format!(
+                "has {} values, expected {ACTION_LEN} (one per policy joint)",
+                values.len()
+            ),
+        ));
+    }
+    // Not a plausibility filter for its own sake: a pose outside the travel every joint has is a
+    // number that would be clamped into something nobody chose, and a NaN would poison every
+    // target derived from it.
+    if let Some(bad) = values
+        .iter()
+        .find(|v| !v.is_finite() || v.abs() > std::f64::consts::PI)
+    {
+        return Err(refuse(
+            "default_joint_pos",
+            format!("has {bad}, which is not an angle inside the +-pi the joints travel"),
+        ));
+    }
+
+    let mut out = DEFAULT_POSITION;
+    for (slot, value) in values.iter().enumerate() {
+        out[crate::obs::joint_of(slot)] = *value;
+    }
+    Ok(out)
+}
+
 fn open(path: &Path) -> Result<Network, PolicyError> {
     let bytes = std::fs::read(path).map_err(|source| PolicyError::Read {
         path: path.to_owned(),
@@ -682,18 +818,150 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
     } else {
         None
     };
+    // Read before the session is moved into the struct, and read as strings: `ort` hands back the
+    // export's own text, so the parsing and its refusals live in `parse_home_pose` where they can be
+    // tested without ONNX Runtime at all.
+    let home_pose = {
+        let metadata = session.metadata().map_err(|source| PolicyError::Load {
+            path: path.to_owned(),
+            source,
+        })?;
+        parse_home_pose(
+            path,
+            metadata.custom("default_joint_pos").as_deref(),
+            metadata.custom("joint_names").as_deref(),
+        )?
+    };
+
     Ok(Network {
         session,
         state,
         action_name,
         path: path.to_owned(),
         digest,
+        home_pose,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The joint list exactly as every shipped and reference export writes it.
+    const NAMES: &str = "left_hip_yaw,left_hip_roll,left_hip_pitch,left_knee,left_ankle,neck_pitch,\
+head_pitch,head_yaw,head_roll,right_hip_yaw,right_hip_roll,right_hip_pitch,right_knee,right_ankle";
+
+    /// No metadata at all means the built-in home, which is what a model predating the field gets.
+    #[test]
+    fn a_model_without_a_stance_keeps_the_built_in_home() {
+        let path = Path::new("/p/velstand.onnx");
+        assert_eq!(parse_home_pose(path, None, None).unwrap(), DEFAULT_POSITION);
+        // And `joint_names` alone changes nothing: the stance is what is being read.
+        assert_eq!(
+            parse_home_pose(path, None, Some(NAMES)).unwrap(),
+            DEFAULT_POSITION
+        );
+    }
+
+    /// **The property that makes this change invisible for every shipped set**: their metadata
+    /// records the same home the binary has, so reading it moves nothing.
+    ///
+    /// Not to the last bit, and the reason is worth knowing rather than tolerating — the export
+    /// writes three decimals, so the model's own copy of the pose differs from the constant by up
+    /// to 0.0003 rad (0.017 degrees). That is the resolution of the *record*, not a disagreement
+    /// about the robot.
+    #[test]
+    fn the_shipped_sets_metadata_agrees_with_the_built_in_home() {
+        let official = "0.000,-0.087,-0.458,-0.005,0.453,0.349,0.349,0.000,0.000,0.000,0.087,0.458,\
+0.005,-0.453";
+        let parsed = parse_home_pose(Path::new("/p/velstand.onnx"), Some(official), Some(NAMES))
+            .expect("the shipped metadata must load");
+        let worst = (0..NUM_JOINTS)
+            .map(|j| (parsed[j] - DEFAULT_POSITION[j]).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst < 0.001,
+            "the shipped stance drifted from the constant by {worst} rad"
+        );
+        assert_eq!(
+            parsed[crate::model::MOUTH_INDEX],
+            DEFAULT_POSITION[crate::model::MOUTH_INDEX],
+            "the mouth is not a policy joint and keeps the built-in value"
+        );
+    }
+
+    /// A model trained against another stance is placed where *it* was trained, and the mouth
+    /// still is not in its list.
+    #[test]
+    fn a_model_carries_its_own_stance() {
+        let xgoduck = "0.000,-0.087,-0.349,-0.005,0.349,0.349,0.349,0.000,0.000,0.000,0.087,0.349,\
+0.005,-0.349";
+        let parsed = parse_home_pose(Path::new("/p/hd1910_walk.onnx"), Some(xgoduck), Some(NAMES))
+            .expect("a well formed stance must load");
+        // By name, not by index: the whole risk in this function is the 14-slot list landing on the
+        // wrong side of the mouth, and an index assertion would be written from the same mistake.
+        let at = |name: &str| parsed[crate::model::joint_index(name).expect(name)];
+        assert!((at("left_hip_pitch") - -0.349).abs() < 1e-9);
+        assert!((at("left_ankle") - 0.349).abs() < 1e-9);
+        // Past the mouth, where an off-by-one would show: slot 11 is the 12th value and the 12th is
+        // `right_hip_pitch`, because joint 9 (`mouth`) has no slot.
+        assert!((at("right_hip_roll") - 0.087).abs() < 1e-9);
+        assert!((at("right_hip_pitch") - 0.349).abs() < 1e-9);
+        assert!((at("right_knee") - 0.005).abs() < 1e-9);
+        assert!((at("right_ankle") - -0.349).abs() < 1e-9);
+        assert_ne!(
+            parsed, DEFAULT_POSITION,
+            "this is the whole point: it is not the built-in pose"
+        );
+        assert_eq!(
+            parsed[crate::model::MOUTH_INDEX],
+            DEFAULT_POSITION[crate::model::MOUTH_INDEX]
+        );
+    }
+
+    /// A stance whose joints are listed in another order would otherwise be believed, silently,
+    /// and every joint after the first difference commanded someone else's angle.
+    #[test]
+    fn a_stance_whose_joint_order_disagrees_is_refused() {
+        let swapped = NAMES.replace("left_hip_yaw,left_hip_roll", "left_hip_roll,left_hip_yaw");
+        let err = parse_home_pose(
+            Path::new("/p/x.onnx"),
+            Some("0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0"),
+            Some(&swapped),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("joint_names"), "{text}");
+        assert_eq!(
+            err.path(),
+            Some(Path::new("/p/x.onnx")),
+            "it names the file"
+        );
+    }
+
+    /// Without the names the numbers cannot be placed at all, and guessing is how a robot ends up
+    /// standing somewhere nobody chose.
+    #[test]
+    fn a_stance_without_its_joint_names_is_refused() {
+        let err = parse_home_pose(Path::new("/p/x.onnx"), Some("0.0"), None).unwrap_err();
+        assert!(err.to_string().contains("joint_names"), "{err}");
+    }
+
+    /// Every way the numbers themselves can be unusable, each refused by name.
+    #[test]
+    fn an_unusable_stance_is_refused() {
+        let path = Path::new("/p/x.onnx");
+        let short = "0.0,0.0,0.0";
+        assert!(parse_home_pose(path, Some(short), Some(NAMES)).is_err());
+        let nan = "NaN,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0";
+        assert!(parse_home_pose(path, Some(nan), Some(NAMES)).is_err());
+        // Inside the travel or not at all: this one would be clamped into an angle nobody chose.
+        let far = "9.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0";
+        let err = parse_home_pose(path, Some(far), Some(NAMES)).unwrap_err();
+        assert!(err.to_string().contains("default_joint_pos"), "{err}");
+        let words = "hips,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0";
+        assert!(parse_home_pose(path, Some(words), Some(NAMES)).is_err());
+    }
 
     /// The threshold decides walking versus standing every tick, so it must match what the
     /// prototype uses or the robot changes gait at a different speed than it was tuned for.

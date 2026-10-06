@@ -36,7 +36,7 @@
 //! prototype let a pick preempt a kick's tail and a chaining skill roll out of a kick or the seat;
 //! here each is refused, and a seated robot accepts only standing up.
 
-use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
+use duck_control::model::NUM_JOINTS;
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
 
@@ -518,7 +518,11 @@ impl Controller {
     /// have produced `pose` (the sitstand network runs at action scale 1), and the filter starts
     /// from it.
     pub fn seed_from_pose(&mut self, pose: &[f64; NUM_JOINTS]) {
-        let offsets: [f64; NUM_JOINTS] = std::array::from_fn(|j| pose[j] - DEFAULT_POSITION[j]);
+        // The sitstand network is the one this seeds — the caller reaches here having found the
+        // robot sitting — so the offset is measured from *its* home, not from the built-in one.
+        // With the shipped sets they are the same number and this is invisible.
+        let home = self.policy.home_pose(Net::SitStand);
+        let offsets: [f64; NUM_JOINTS] = std::array::from_fn(|j| pose[j] - home[j]);
         self.last_action = Observation::gather_action(&offsets);
         self.previous = Some(*pose);
     }
@@ -652,11 +656,17 @@ impl Controller {
 
         self.last_net = Some(net);
 
+        // The pose this network's actions are centred on, from the model's own metadata. For the
+        // shipped sets it *is* `DEFAULT_POSITION` — which is why this changes nothing for them —
+        // and for a model trained against another stance it is what keeps the observation and the
+        // action base describing the same robot. Read before `infer`, because it is an argument to
+        // the observation that `infer` consumes.
+        let home_pose = self.policy.home_pose(net);
         let observation = Observation::build(
             &sensors.imu,
             &sensors.positions,
             &sensors.velocities,
-            &DEFAULT_POSITION,
+            &home_pose,
             &self.last_action,
             &effective,
         );
@@ -718,7 +728,7 @@ impl Controller {
         let offsets = Observation::scatter_action(&action);
         let mut targets = [0.0; NUM_JOINTS];
         for joint in 0..NUM_JOINTS {
-            targets[joint] = DEFAULT_POSITION[joint] + scale * offsets[joint];
+            targets[joint] = home_pose[joint] + scale * offsets[joint];
         }
 
         if let Some(previous) = self.previous {
@@ -767,6 +777,7 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duck_control::model::DEFAULT_POSITION;
 
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]

@@ -116,6 +116,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    // The other "what does this robot's firmware understand" bit, and the reason the two sit
+    // together: a robot is one or the other, never both, and the port is not shared.
+    entry(
+        "bus.scs",
+        Kind::Bool,
+        "FeeTech SCS/HLS servos (1910) instead of Dynamixel — needs bus.scs_config",
+    ),
+    // A path rather than the numbers themselves. The file holds fifteen *measured* encoder zeros,
+    // which is a calibration and not a preference: offering to retype one from a key/value editor
+    // is offering to break the robot.
+    entry(
+        "bus.scs_config",
+        Kind::OptionalPath,
+        "File describing the FeeTech bus: node id, mounting, gains, per-joint encoder zero",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
@@ -158,8 +173,14 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "policy.mode",
         Kind::Choice(&["walk", "roller"]),
-        "Legs or the roller: picks policies and tuning. `robot.setMode` switches it live; this \
-         is the mode a reboot comes back in",
+        "Legs or the roller: picks policies and tuning. This is the mode a reboot comes back \
+         in; `policy.mode_switch` decides whether it can also change while running",
+    ),
+    feature(
+        "policy.mode_switch",
+        Kind::Bool,
+        "Allow the live walk/roller switch. Off pins the robot to `policy.mode` and refuses \
+         `robot.setMode` — for a robot whose other mode's policies are not ready",
     ),
     entry(
         "policy.skill",
@@ -725,6 +746,7 @@ mod tests {
             vec![
                 "policy.enabled",
                 "policy.mode",
+                "policy.mode_switch",
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
