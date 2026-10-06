@@ -70,10 +70,33 @@ ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 ENV_BOARD="${DUCK_BOARD:-}"
 ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
 ENV_RKAIQ="${DUCK_RKAIQ:-}"
+ENV_GITHUB_RAW="${DUCK_GITHUB_RAW:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck}"
 REF="${ENV_REF:-main}"
-RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+
+# The host `install.sh`, `setup-board.sh` and the rest are fetched from. A variable so a
+# private mirror is one export for the whole bring-up rather than an edit in every script;
+# `install.sh` and the board scripts read the same name, which is what the comment above means
+# by one decision for the whole bring-up. Default is the public host, byte for byte.
+#
+# Kept as `DUCK_GITHUB_RAW` rather than lower-cased because it is not this script's private
+# value: it is carried into `install.sh`'s environment and into the state file, and a name that
+# changed case between the two would be an override that works in phase 1 and not in phase 2.
+#
+# `load_state` sets it again from the file after the reboot, for phase 2's own fetches.
+DUCK_GITHUB_RAW="${ENV_GITHUB_RAW:-https://raw.githubusercontent.com}"
+duck_raw="${DUCK_GITHUB_RAW%/}"
+RAW="${duck_raw}/${REPO}/${REF}/scripts"
+
+# The web host this run's GitHub-page URLs are built from — one `Documentation=` line in the
+# resume unit, and (read straight out of the environment, by the script that does it) the
+# `releases/download` URL `setup-board.sh` takes ONNX Runtime from. Default is the public host,
+# byte for byte.
+#
+# Deliberately not carried across the reboot: the unit that names it is written in phase 1, so
+# phase 2 has nothing left to build it into. `DUCK_GITHUB_RAW` is the one that has to survive,
+# and it does.
 
 # For a private repository: a token with read access to contents. Carried across the reboot in
 # the state file rather than asked for twice — see `save_state` for why not `~/.profile`.
@@ -273,6 +296,11 @@ save_state() {
     {
         kv DUCK_REPO "$REPO"
         kv DUCK_REF "$REF"
+        # Carried for the same reason as the two above it: phase 2 fetches `install.sh` and the
+        # board scripts from this host, and a private mirror the operator named would otherwise
+        # be forgotten at the reboot — the run would then fail on a 404 from a host it was
+        # never told to use, on a board whose operator is watching a log file.
+        kv DUCK_GITHUB_RAW "$DUCK_GITHUB_RAW"
         kv DUCK_TOKEN "$TOKEN"
         kv DUCK_DEV_KEY "$1"
         kv DUCK_FORCE_REINSTALL "$FORCE_REINSTALL"
@@ -298,6 +326,9 @@ load_state() {
 
     REPO="${ENV_REPO:-${DUCK_REPO:-$REPO}}"
     REF="${ENV_REF:-${DUCK_REF:-$REF}}"
+    # The operator's environment wins over the file, like everything else here — a mirror typed
+    # on the phase 2 command line is a correction, not something the old state should override.
+    DUCK_GITHUB_RAW="${ENV_GITHUB_RAW:-${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}}"
     TOKEN="${ENV_TOKEN:-${DUCK_TOKEN:-}}"
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
@@ -310,7 +341,7 @@ load_state() {
     # kept somewhere else to still win. Nothing else writes `PROVISION_NAME`, so a `--name` on the
     # phase 2 command line survives the sourcing and can simply be preferred.
     NAME="${NAME:-${PROVISION_NAME:-}}"
-    RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+    RAW="${DUCK_GITHUB_RAW%/}/${REPO}/${REF}/scripts"
     return 0
 }
 
@@ -427,7 +458,7 @@ install_resume_unit() {
     cat > "$UNIT" <<EOF
 [Unit]
 Description=Finish robot provisioning after the reboot
-Documentation=https://github.com/${REPO}/blob/${REF}/deploy/README.md
+Documentation=${DUCK_GITHUB_DOWNLOAD:-https://github.com}/${REPO}/blob/${REF}/deploy/README.md
 # Never run on a board that has already finished: \`finish\` removes this file.
 ConditionPathExists=${STATE}
 # install.sh downloads a release, so this needs a network that is actually up — not merely
@@ -618,7 +649,11 @@ phase_two() {
     DUCK_TOKEN="$TOKEN"
     DUCK_FORCE_REINSTALL="$FORCE_REINSTALL"
     DUCK_BOARD="$BOARD"
-    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL DUCK_BOARD
+    # Passed on for the same reason as the rest: `install.sh` fetches its config and keys from
+    # this host, and a mirror named to phase 1 must not mean nothing to the script that does
+    # the actual installing.
+    DUCK_GITHUB_RAW="$DUCK_GITHUB_RAW"
+    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL DUCK_BOARD DUCK_GITHUB_RAW
     if [ -n "$DEV_KEY" ]; then
         DUCK_DEV_KEY="$DEV_KEY"
         export DUCK_DEV_KEY

@@ -120,6 +120,33 @@ manifest_asset = "manifest.json"
 # if it somehow resolved the tag.
 # ref_tag_prefix = "daemon-dev-"
 
+# Where this source talks. Both defaulted to the public service, so a robot that names
+# neither sends the URLs it always did — these exist so that a robot which must not reach
+# the public host is a config change rather than a patched crate.
+#
+# They are two fields because they answer different questions, and a robot needing one
+# usually needs the other set to the *same* host only by coincidence.
+#
+# `api_base` is where this daemon sends its own requests: metadata, and the bytes of a
+# private release's assets. A self-hosted GitHub normally prefixes the API path.
+#
+# api_base = "https://api.github.com"
+# api_base = "https://github.example.com/api/v3"
+#
+# `download_base` is the host a *manifest's own* `url` names, and it is what lets the source
+# recognise its own artifacts. That recognition is load-bearing rather than cosmetic: a
+# private repository's `releases/download/...` URL answers 404 even with a token, so a URL
+# this matches is re-resolved through the API instead. It must therefore be the host the
+# publishing CI actually used — a mirror that serves the same bytes under a different name
+# cannot be expressed here. Anything that does not match is fetched verbatim, which is what
+# keeps an unverified manifest from aiming an authenticated request at a host it chose.
+#
+# download_base = "https://github.com"
+#
+# Both are stripped of a trailing slash, so `https://github.com/` means the same base rather
+# than a doubled slash the server reads as a different path.
+# download_base = "https://github.example.com"
+
 # NOTE the omissions here. `updaterd` restarts NEITHER itself NOR `btd`, even though
 # both ship in this artifact:
 #   - restarting itself would kill the executor mid-swap/mid-health-gate — the update
@@ -172,6 +199,15 @@ type          = "hf_hub"
 repo          = "ORG/gait-walk"
 revision      = "main"
 manifest_file = "manifest.json"
+# The Hub host, without a trailing slash. Defaulted, so naming nothing keeps the public Hub;
+# it exists so a robot that must not reach it can point at a mirror with config alone.
+#
+# One field for both requests the source makes — the `resolve` a file comes from and the `refs`
+# lookup that turns a bare 404 into "has no tag v1.2.3 (available: …)". A mirror serving only
+# one of the two would report every version as missing, which reads as a withdrawn release.
+#
+# endpoint = "https://huggingface.co"
+# endpoint = "https://hub.internal"
 
 # Bootstrap-inert until robotd exists — see the daemon component above.
 [component.model-walk.on_apply]
@@ -191,6 +227,8 @@ keep_previous = 3
 type          = "hf_hub"
 repo          = "ORG/gait-jump"
 revision      = "main"
+# `endpoint` as on `model-walk` above: defaulted to the public Hub.
+# endpoint = "https://huggingface.co"
 
 # Bootstrap-inert until robotd exists — see the daemon component above.
 [component.model-jump.on_apply]
@@ -210,6 +248,23 @@ probe = "none"
 #
 # Signature verification is NOT relaxed: sideloading works because the dev key is
 # in the trusted set, not because checks are skipped.
+#
+# The directory is flat and holds one signed release per version:
+#
+#     <version>.manifest.json
+#     <version>.manifest.json.minisig
+#     <the artifact the manifest's `url` names>
+#     <that name>.minisig
+#
+# A manifest's `url` must be a bare filename here, not a URL: a directory source has no
+# host to resolve one against, and `../` would leave the directory.
+#
+# **An empty directory is not a fault, but it is not an answer either.** `latest` on an
+# empty one fails with "no manifests in <path>", and a `check` against a *missing* one
+# fails with the underlying I/O error — there is nothing to install, and that is what a
+# status reader is told. Worth knowing when picking this as a shipped default: a robot that
+# never sideloads anything reports a failing source for its one component, so pair it with
+# no `check_interval` above and the failure is only ever said to somebody who asked.
 #
 # [component.daemon.source]
 # type = "local_dir"

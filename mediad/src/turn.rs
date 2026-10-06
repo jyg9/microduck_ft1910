@@ -50,6 +50,11 @@ use serde::Deserialize;
 /// them one of those four delegated nameservers would serve records for the name, pass DNS
 /// validation for a certificate on it, and be handed the token. `reachy_mini` #1408 made the same
 /// move and measured a relay pair carrying video through it.
+///
+/// **A default, not a fact about this robot.** `--turn-url` takes precedence and `DUCK_TURN_URL`
+/// overrides the default (`main.rs`); both go through [`parse_endpoint`], so the environment
+/// cannot introduce the plain `http` the flag refuses. A deployment running its own proxy says so
+/// there rather than here, because this constant lives in a binary an update replaces.
 pub const DEFAULT_TURN_ENDPOINT: &str = "https://fastrtc-turn-service.hf.space/credentials";
 
 /// A `--turn-url` worth handing the account token to, or the reason it is not one.

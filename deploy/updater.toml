@@ -32,25 +32,32 @@ robot_socket = "/run/robotd.sock"
 allow_dev_keys        = false
 allow_fault_injection = false
 
-# What makes `min_supported` mean anything. Without a poll a robot only learns a floor
-# exists when someone opens the app, so "we shipped a bad release" would be unfixable on
-# any robot whose owner is away (§8.1).
-check_interval = "6h"
+# **No `check_interval`, and that is the decision this file is built around.**
+#
+# The periodic check is the one thing this robot does with nobody watching, and it is an
+# outbound request to a host we do not run: the robot's own address ends up in somebody
+# else's access log. Nothing is sent that names the robot — it is an unauthenticated `GET`
+# — but the request itself is the disclosure, and a robot that never makes it cannot be
+# enumerated by watching one.
+#
+# Omitting the key disables polling entirely, which also makes `min_supported` inert: a
+# withdrawn release is noticed when somebody asks rather than on its own (§8.1). That is the
+# trade this robot makes deliberately. `updater.example.toml` keeps a `check_interval` and
+# explains what it buys; a fleet robot wants that, and this robot is not on the fleet.
+#
+# Pointing it at a host again is a config change rather than a rebuild — see the source block
+# at the bottom of this file, which documents the two fields that do it.
+# check_interval = "6h"
 
-# What the periodic check may install with no client attached: "off", "mandatory", "all".
+# `off`, and with no `check_interval` above it would be inert whatever it said. Written out
+# rather than left to a default so that the two cannot be restored one at a time: a robot that
+# re-added a timer without revisiting this line would start restarting itself.
 #
-# `mandatory` — a release whose manifest carries `min_supported` above the running version
-# — because the alternative is a fleet stuck on a release we have already withdrawn.
-# Ordinary releases still wait for a client: when a robot restarts is its owner's
-# decision, and the app-driven update flow exists to give them that decision.
-#
-# `all` is for canary and bench robots (§16.2 Tier 2): they track a channel and install
-# every candidate. Setting it here would opt every client robot into unattended restarts.
-#
-# Whichever is set, an unattended apply is an ordinary apply — same preflight, so a robot
-# that is walking or streaming refuses and retries at the next interval; same health gate,
-# so a release that does not come up is rolled back.
-auto_apply = "mandatory"
+# The other two values are for a robot that takes releases from a channel somebody operates.
+# `mandatory` pulls itself forward when a release is withdrawn; `all` is the canary and bench
+# setting (§16.2 Tier 2), which on a robot like this one takes the "when does my robot restart"
+# decision away from its owner. Neither applies: there is no channel here to take releases from.
+auto_apply = "off"
 
 # Who may apply, roll back, select or pin. Read-only calls — status, log, listInstalled,
 # check, subscribe — are never gated by this: reaching the socket already requires its group
@@ -94,39 +101,92 @@ required_files = [
     "bin/tofd",
 ]
 
-# `golden` is deliberately unset until 1.0.0 exists.
+# `golden` is deliberately unset, and it must not be set to a guess.
 #
-# It names a never-pruned known-good release, and `robotctl update reset-to-golden` is
-# the last link in the never-brick chain (§8.2). Naming a version the robot has never
-# installed would make that command fail at exactly the moment it is needed, which is
-# worse than it reporting honestly that no golden is configured. Set it in the same
-# change that ships 1.0.0.
-# golden = "1.0.0"
+# It names a never-pruned known-good release, and `robotctl update reset-to-golden` is the last
+# link in the never-brick chain (§8.2). `updaterd` publishes the `golden` symlink on every start,
+# but only for a version that is already installed — one this robot has never had is refused with
+# "refusing to link missing release", and the guarantee is then void on a board that looks
+# configured. That is why it is left out until there is something true to name.
+#
+# Arming it is one line naming **the version this board actually runs today**, read off the live
+# release rather than chosen:
+#
+#     readlink /opt/robot/daemon/current     # releases/<version>
+#     robotctl update status                 # the same version, by name
+#
+# Set it in the same change that installs that release.
+# golden = "<the version `current` points at>"
 
-# The stable channel. `daemon-v*` tags only: staging publishes `daemon-staging-v*` and
-# marks it prerelease, so it is excluded twice over and a client robot cannot drift onto
-# a candidate build.
+# **A local directory: signed releases are dropped here and installed from here.** No host, no
+# channel, nothing to poll. The point of the change is that a `github_releases` source here would
+# be a standing egress to a public host on a robot that is not on the manufacturer's fleet.
+#
+# What this does *not* cost is any guarantee. An artifact found in this directory is verified
+# exactly like a downloaded one — the same minisign check against the same trust anchor in
+# `trusted_keys_dir`, the same hash check, the same preflight, the same health gate that makes
+# rollback real, the same golden. Sideloading works because the signing key is trusted, not
+# because a check is skipped (`source/local.rs`).
+#
+# Two ways releases arrive here:
+#   * `updaterd install --from <dir>` / `robotctl update apply daemon --from <dir>`, which is what
+#     `scripts/dev-push.sh` uses and which **overrides this key** for that one command. This is how
+#     a development board is driven.
+#   * dropping the files here by hand, and then `robotctl update apply daemon` with no `--from`.
+#     This is the durable path, because a signed release left in a directory survives a reboot,
+#     a rollback and somebody's shell history.
+#
+# The layout is a flat directory, per `source/local.rs`:
+#
+#     <version>.manifest.json
+#     <version>.manifest.json.minisig
+#     <the artifact the manifest's `url` names>
+#     <that name>.minisig
+#
+# **It may be empty, and an empty one is not a fault.** A check against it fails with "no
+# manifests in <dir>", which is the honest answer: there is nothing to install. Nothing polls, so
+# that message is only ever said to somebody who asked for it.
+#
+# `/var/lib/robot/sideload` rather than somewhere under `/opt/robot/daemon`: that tree is what an
+# apply prunes and swaps, and a drop directory inside it is a directory an update could delete.
+# `/var/lib/robot` is the robot's state root, already created at provisioning, and already where
+# the update journal and the sound bank live. It is outside `state_dir` above so that clearing the
+# journal is not something anybody does to the pending release by accident.
 [component.daemon.source]
-type           = "github_releases"
-repo           = "ORG/duck-daemon"
-tag_prefix     = "daemon-v"
-manifest_asset = "manifest.json"
-# Tag prefix for per-branch dev builds, so `--ref my-branch` resolves to
-# `daemon-dev-my-branch`. Shown for completeness — this is the default.
-#
-# Separate from tag_prefix because the two streams must never be confusable: a dev tag
-# *moves* (it points at whatever that branch last built) while a release tag is immutable,
-# and `latest` for the fleet must never consider a dev tag. Installing one also requires
-# allow_dev_keys and the dev public key, so a client robot cannot take a branch build even
-# if it somehow resolved the tag.
-# ref_tag_prefix = "daemon-dev-"
+type = "local_dir"
+path = "/var/lib/robot/sideload"
 
-# Where `--staging` looks: the tags `release.yml` pushes for release candidates. Shown for
-# completeness — this is the default, and a robot needs no configuration to reach a candidate.
+# ── taking releases from a host again ────────────────────────────────────────────────────────
 #
-# Reaching one still takes a person with root typing `--staging`. A candidate is flagged as a
-# prerelease, which `latest` skips, so nothing here makes this robot *track* candidates.
-# staging_tag_prefix = "daemon-staging-v"
+# Documented, not active: nothing in this block is read by anything until the two source blocks
+# above and below are swapped. It is here because the whole point of `api_base`/`download_base` is
+# that re-pointing a robot at a private host is config rather than a patch to this repository.
+#
+#   # api_base       where *this daemon* sends its requests. Defaults to the public GitHub API.
+#   # download_base  the host a manifest's own `download/...` URLs name. Defaults to
+#   #                `https://github.com`, and it must be the host the publishing CI actually used:
+#   #                a private repository's `releases/download/...` URL 404s even with a token, so
+#   #                those URLs are re-resolved through the API, and that recognition is matching a
+#   #                manifest against this value. A manifest naming a host other than this one is
+#   #                fetched verbatim rather than re-resolved, which is what keeps an unverified
+#   #                manifest from aiming an authenticated request at a host it chose.
+#   #
+#   # Both are stripped of a trailing slash, so `https://github.com/` and `https://github.com` are
+#   # the same base rather than a doubled slash that 404s.
+#
+# [component.daemon.source]
+# type           = "github_releases"
+# repo           = "your-org/duck-daemon"
+# tag_prefix     = "daemon-v"
+# manifest_asset = "manifest.json"
+# api_base       = "https://api.github.com"
+# download_base  = "https://github.com"
+#
+# A self-hosted GitHub moves both, and they are not always the same host — an API that lives under
+# a path prefix is the normal Enterprise shape:
+#
+# api_base       = "https://github.example.com/api/v3"
+# download_base  = "https://github.example.com"
 
 # `updaterd` restarts neither itself nor `btd`, both of which ship in this same artifact:
 # restarting itself would kill the executor mid-update, and restarting `btd` would drop
@@ -183,7 +243,10 @@ timeout = "30s"
 # Absent on purpose, and this is not an oversight to be fixed by copying the example.
 #
 # `updater.example.toml` configures `model-walk` and `model-jump` against HF repos that
-# do not exist yet. A component whose source 404s makes every `check` — including the
-# periodic one above — report a failure for a component nobody has shipped, which trains
-# whoever reads robot status to ignore failures. Each model component lands in the change
-# that first publishes its bundle.
+# do not exist yet. A component whose source cannot answer makes every `check` report a
+# failure for a component nobody has shipped, which trains whoever reads robot status to
+# ignore failures. Each model component lands in the change that first publishes its bundle.
+#
+# This robot's models arrive inside the daemon artifact or from the same sideload directory,
+# so there is nothing here to point at an HF mirror either. If one is ever added, `endpoint`
+# on an `hf_hub` source is the field that moves it off the public Hub.

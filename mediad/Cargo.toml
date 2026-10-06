@@ -57,7 +57,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # Default features off: this serves one file over GET, and JSON extractors, multipart, forms and
 # tracing middleware are all weight for routes that do not exist.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-clap = { workspace = true, features = ["derive"] }
+# `env`, so the rendezvous and TURN endpoints can be re-pointed from a systemd drop-in rather
+# than from `mediad.service` — which the release installer rewrites, so an edit to it lasts until
+# the next update. `xtask` takes clap's `env` for the same reason on a shorter timescale.
+clap = { workspace = true, features = ["derive", "env"] }
 # The relay's half of the bridge: HTTPS to the rendezvous service — SSE inbound, `POST /send`
 # outbound. Same line `updater` uses, minus `form` (nothing here posts a form), so the TLS stack
 # and its version are the ones already resolved for this workspace and its cross build.

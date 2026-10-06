@@ -103,6 +103,13 @@
 #     ethernet lease that moves is still a lease nothing here can find.
 set -eu
 
+# Where `provision.sh` is fetched from, for the board to run. Defaults are the public repository
+# and host, and they are overridable here because this is the one place in the bring-up that
+# writes a URL for the *board* to fetch — so a mirror is one export on the operator's machine
+# rather than an edit, and the value is then carried onto the board below like `DUCK_REF` is.
+REPO="${DUCK_REPO:-pollen-robotics/microduck}"
+GITHUB_RAW="${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}"
+
 # Committed, so a new developer needs nothing from anybody to provision a dev board. `--dev-key`
 # overrides it for a key handed over out of band.
 DEV_KEY_DEFAULT="$(dirname "$0")/../deploy/dev-key/team.dev.pub"
@@ -704,7 +711,7 @@ if [ -n "$USE_LOCAL" ]; then
     say "sending this clone's provision.sh"
     scp -q "$_local" "$(scp_target /tmp/provision.sh)" || die "could not copy provision.sh"
 else
-    _raw="https://raw.githubusercontent.com/pollen-robotics/microduck/${REF:-main}/scripts/provision.sh"
+    _raw="${GITHUB_RAW%/}/${REPO}/${REF:-main}/scripts/provision.sh"
     say "having the board fetch provision.sh from ${REF:-main}"
     # Fetched by the board rather than by this machine and copied over: the board is the one
     # that has to be able to reach GitHub with that token, and finding out here would prove
@@ -722,6 +729,13 @@ echo
 
 _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
+# Only when they differ from the defaults, which is what keeps the board's own copy of
+# `provision.sh` honest: it reads `DUCK_REPO`/`DUCK_GITHUB_RAW` too, so passing either on would
+# be this script overriding a default with the same value. It exists so a mirror named on the
+# operator's machine is the mirror the board's later fetches use.
+[ "$REPO" = "pollen-robotics/microduck" ] || _env="${_env} DUCK_REPO='${REPO}'"
+[ "$GITHUB_RAW" = "https://raw.githubusercontent.com" ] \
+    || _env="${_env} DUCK_GITHUB_RAW='${GITHUB_RAW}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
 [ -z "$BOARD" ]     || _env="${_env} DUCK_BOARD=${BOARD}"

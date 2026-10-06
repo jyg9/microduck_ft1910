@@ -781,11 +781,16 @@ cp -a /bin/release/. "$REL"/
 ln -sfn releases/under-test /opt/robot/daemon/current
 
 # The operator files, pre-placed. install.sh never overwrites these — the behaviour that let a
-# board keep a stale on_apply list for months — so this takes the branch a re-install takes,
-# and substitutes the repository the way the fetch path would.
+# board keep a stale on_apply list for months — so this takes the branch a re-install takes.
+#
+# Byte for byte, with no substitution. The `sed` that used to rewrite the placeholder repository
+# here went with the placeholder: the source named in the shipped config is a local directory
+# now, so there is no `repo` field to rewrite and `install.sh` itself installs the file unchanged (its
+# placeholder guard survives for boards provisioned before this, and for anyone who puts a
+# GitHub source back — `installer_guard_and_shipped_config_agree_about_the_placeholder` in
+# `updater/src/config.rs` is what keeps the two statements from drifting apart).
 mkdir -p /etc/robot
-sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck\"|" \
-    /bin/deploy/updater.toml > /etc/robot/updater.toml
+cp /bin/deploy/updater.toml /etc/robot/updater.toml
 cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
 
 # What Armbian ships in /etc/cron.d: a simulated `apt-get upgrade` at every boot, whose only
@@ -808,6 +813,91 @@ PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/install.log 2>&1 || {
     exit 1
 }
 echo "    [ok] install.sh runs to completion on a board with a release already live"
+
+# ── where the first release comes from: the local_dir path ──
+#
+# `bootstrap_first_release` used to hand `updaterd` no `--from`, so it resolved `latest` from
+# whatever source the config named. On the shipped config that source is a directory now, and
+# the run failed with "no manifests in /var/lib/robot/sideload" on a bare board — the official
+# provisioning path, broken by a config change that was correct on its own. The fix is to read
+# the source out of the installed config and use the `--from` path the header already describes.
+#
+# What is testable without a signed artifact and a bare board is exactly the decision: which
+# path the config names, and the diagnosis when nothing is there. The install itself is the
+# engine path, and `updater/tests/install.rs` drives that through `--from` already.
+#
+# Everything between the opening `CHECKS=` quote and the closing one is a single-quoted string to
+# the *outer* shell, and the two `CHECK` heredocs inside it are only heredocs to the inner one.
+# An odd number of apostrophes anywhere in this span leaves that outer string open, and the
+# syntax error then names a line six hundred further down — which is exactly what the first
+# version of this block did. Every comment added here must keep the count even, or avoid the
+# character altogether, which is easier.
+cat > /tmp/local-source-check.sh <<"CHECK"
+set -eu
+DUCK_INSTALL_LIB_ONLY=1 . /bin/scripts/install.sh
+D="$(dirname "$0")"
+
+# The shipped config, read the way install.sh reads it on a real board.
+want=/var/lib/robot/sideload
+got="$(local_source_dir /etc/robot/updater.toml || true)"
+[ "$got" = "$want" ] || {
+    echo "    [FAIL] local_source_dir read ${got}, not ${want}"
+    exit 1
+}
+
+# `path` before `type`, which is legal TOML and must not change the answer.
+printf "[component.daemon.source]\npath = \"/reversed\"\ntype = \"local_dir\"\n" > "$D/reversed.toml"
+got="$(local_source_dir "$D/reversed.toml" || true)"
+[ "$got" = "/reversed" ] || {
+    echo "    [FAIL] a source naming path first read ${got}"
+    exit 1
+}
+
+# Another component with a local_dir must not be mistaken for the daemon source. `path` is a key
+# four blocks use, and the answer for the daemon is not whichever one comes first in the file.
+printf "[component.models.source]\ntype = \"local_dir\"\npath = \"/wrong\"\n" > "$D/models.toml"
+if local_source_dir "$D/models.toml" >/dev/null 2>&1; then
+    echo "    [FAIL] another component local_dir was read as the daemon source"
+    exit 1
+fi
+
+# A commented example is not a source. The shipped file is full of them.
+printf "[component.daemon.source]\n# type = \"local_dir\"\ntype = \"github_releases\"\nrepo = \"a/b\"\n" \
+    > "$D/commented.toml"
+if local_source_dir "$D/commented.toml" >/dev/null 2>&1; then
+    echo "    [FAIL] a commented type was read as the daemon source"
+    exit 1
+fi
+
+# An empty directory, and a directory holding only a manifest, are both diagnosed rather than
+# passed to updaterd — whose own answer names the path and nothing an operator can act on. The
+# second case is the one that catches a half-copied release: signature verification would refuse
+# it anyway, but it would do so after the binary download and with a message about a signature.
+mkdir -p "$D/empty" "$D/manifest-only"
+printf "{}" > "$D/manifest-only/1.2.3.manifest.json"
+for bad in empty manifest-only; do
+    if local_source_ready "$D/$bad" >/dev/null 2>&1; then
+        echo "    [FAIL] local_source_ready accepted $D/$bad"
+        exit 1
+    fi
+done
+# And the shape it is supposed to accept.
+mkdir -p "$D/full"
+printf "{}" > "$D/full/1.2.3.manifest.json"
+printf "sig" > "$D/full/1.2.3.manifest.json.minisig"
+local_source_ready "$D/full" >/dev/null 2>&1 || {
+    echo "    [FAIL] local_source_ready rejected a directory holding a manifest and its signature"
+    exit 1
+}
+
+echo "ok"
+CHECK
+if ! out="$(sh /tmp/local-source-check.sh 2>&1)"; then
+    echo "    [FAIL] the local_dir bootstrap decision is wrong:"
+    printf "%s\n" "$out"
+    exit 1
+fi
+echo "    [ok] install.sh reads a local_dir source, and diagnoses an empty one"
 
 # Every unit the release ships, installed where systemd reads them. install.sh globs the
 # release directory rather than naming units, so this walks the same set rather than a list

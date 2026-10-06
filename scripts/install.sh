@@ -43,6 +43,12 @@
 # The residual trust is GitHub itself, which is also where this script came from — step
 # (4) narrows it rather than removing it. An install that wants no such window should use
 # `updaterd install --from <dir>` against files carried in by hand.
+#
+# Both hosts above are the *defaults*: `DUCK_GITHUB_RAW` and `DUCK_GITHUB_API` move them for
+# a private mirror, because a fork that must not depend on github.com still needs steps (1)
+# and (2) to work. `deploy/updater.toml`'s `api_base`/`download_base` do the same job for
+# everything the *daemon* fetches later; these two exist because the bootstrap bytes here
+# are fetched by this script, before any config on the board is read.
 
 set -eu
 
@@ -50,6 +56,23 @@ set -eu
 
 # The repository releases are published from. Override for a fork or a test repo.
 REPO="${DUCK_REPO:-pollen-robotics/microduck}"
+
+# The two hosts this script fetches its own bytes from, so a private mirror is a variable
+# rather than an edit here. Two, not one, because GitHub's own split is real and a
+# self-hosted GitHub keeps it (raw content and the API are routinely different names behind
+# a proxy). The daemon's config has the same split for the same reason — `api_base` and
+# `download_base` in `deploy/updater.toml` — and these are the script's copy of it, for the
+# bytes this script fetches itself *before* any config is honoured.
+#
+# Defaults are the public hosts, byte for byte, so a run that sets neither is the run this
+# script has always done. A trailing slash is stripped rather than trusted: every URL below
+# is built by appending `/...`, and `https://mirror/` + `/path` is a double slash a proxy
+# may answer 404 to. `DUCK_GITHUB_DOWNLOAD` is deliberately not here — nothing in this
+# script fetches a `releases/download` URL, and an unused knob is a promise nobody keeps.
+GITHUB_RAW="${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}"
+GITHUB_API="${DUCK_GITHUB_API:-https://api.github.com}"
+GITHUB_RAW="${GITHUB_RAW%/}"
+GITHUB_API="${GITHUB_API%/}"
 
 # Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
 #
@@ -129,7 +152,7 @@ DEV_KEY="${DUCK_DEV_KEY:-}"
 # and registered a default pairing agent leaves both behind when it dies.
 NO_START="${DUCK_NO_START:-}"
 
-RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
+RAW="${GITHUB_RAW}/${REPO}/${REF}"
 BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 
 # Set by `resolve_bootstrap_asset`. A global rather than a `$(...)` result so a failure can
@@ -256,11 +279,11 @@ install_config() {
 
     # Where the *config* comes from, as opposed to the keys and the scripts.
     if [ -n "$CONFIG_REF" ]; then
-        config_raw="https://raw.githubusercontent.com/${REPO}/${CONFIG_REF}"
+        config_raw="${GITHUB_RAW}/${REPO}/${CONFIG_REF}"
         warn "config from ${CONFIG_REF} because DUCK_CONFIG_REF asked for it. If that ref has
   fields the release being installed does not know, updaterd will refuse to start."
     elif [ -n "$RELEASE_TAG" ]; then
-        config_raw="https://raw.githubusercontent.com/${REPO}/${RELEASE_TAG}"
+        config_raw="${GITHUB_RAW}/${REPO}/${RELEASE_TAG}"
         say "config from ${RELEASE_TAG}, matching the release being installed"
     else
         config_raw="$RAW"
@@ -330,7 +353,7 @@ resolve_bootstrap_asset() {
     # different "latest" releases if one is published mid-install.
     [ -z "$BOOTSTRAP_URL" ] || return 0
 
-    api="https://api.github.com/repos/${REPO}/releases/latest"
+    api="${GITHUB_API}/repos/${REPO}/releases/latest"
     json="$(mktemp)"
 
     if ! fetch "$api" "$json"; then
@@ -375,7 +398,164 @@ resolve_bootstrap_asset() {
     )"
     rm -f "$json_compact"
 
-    BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
+    BOOTSTRAP_URL="${GITHUB_API}/repos/${REPO}/releases/assets/${id}"
+}
+
+# Where the *installed* config takes releases from, when that is a local directory.
+#
+# The shipped `deploy/updater.toml` names a `local_dir`, and the alternative to reading it
+# here is asking the network for a release this robot is configured never to be offered —
+# which is the one thing the file's missing `check_interval` and local source exist to
+# prevent. The only reader of this value is `bootstrap_first_release`.
+#
+# Two lines answer the question — `type` and `path` — and neither is enough alone. `path` is a
+# key four different blocks use (every component's source), so the search is scoped to
+# `[component.daemon.source]`, the only block whose `local_dir` means "this robot's daemon comes
+# off a disk"; and `type` is what says the directory is meant to be read rather than, say, a model
+# bundle. Answering on the first `path` in the file would be answering with whichever component
+# happens to be declared first.
+#
+# The first *uncommented* occurrence wins, and a commented one is skipped rather than
+# trusted: this file is full of example values in comments. That skip assumes a comment starts
+# at column one, which is how every one of them is written (`grep -m1 '^[^#]*path'` would not
+# do — the pattern would match the whitespace before an indented field rather than the field).
+# Stated here, and pinned by the board test.
+local_source_dir() {
+    _lsd_config="${1:-${CONFIG_DIR}/updater.toml}"
+    [ -f "$_lsd_config" ] || return 1
+
+    _lsd_section=""
+    _lsd_component=no
+    _lsd_in_source=no
+    _lsd_type=""
+    _lsd_path=""
+    while IFS= read -r _lsd_line; do
+        case "$_lsd_line" in
+            ''|'#'*) continue ;;
+            \[*)
+                # The whole header, `[` and `]` stripped, so the two tests below cannot match a
+                # longer name by prefix (`component.daemon.source.extra`).
+                _lsd_section="${_lsd_line%%]*}"
+                _lsd_section="${_lsd_section#\[}"
+                _lsd_in_source=no
+                _lsd_component=no
+                case "$_lsd_section" in
+                    component.daemon) _lsd_component=yes ;;
+                    component.daemon.source) _lsd_component=yes; _lsd_in_source=yes ;;
+                esac
+                continue
+                ;;
+        esac
+
+        # An inline `source = { type = ..., path = ... }` is one line of the enclosing
+        # `[component.daemon]`, so that section counts as one too. Real configs are written in
+        # the block form (the shipped file, and what install.sh installs), but the engine
+        # accepts the inline one and a board hand-edited into it must not be sent to the
+        # network by this function answering "no local source".
+        if [ "$_lsd_component" = no ] && [ "$_lsd_in_source" = no ]; then
+            case "$_lsd_line" in
+                source*=*'{'*) ;;
+                *) continue ;;
+            esac
+        fi
+
+        if [ -z "$_lsd_path" ]; then
+            _lsd_value="$(printf '%s\n' "$_lsd_line" \
+                | grep -m1 -o 'path[[:space:]]*=[[:space:]]*"[^"]*"' \
+                | sed 's/.*"\(.*\)"/\1/')"
+            [ -n "$_lsd_value" ] && _lsd_path="$_lsd_value"
+        fi
+        if [ -z "$_lsd_type" ]; then
+            _lsd_value="$(printf '%s\n' "$_lsd_line" \
+                | grep -m1 -o 'type[[:space:]]*=[[:space:]]*"[^"]*"' \
+                | sed 's/.*"\(.*\)"/\1/')"
+            [ -n "$_lsd_value" ] && _lsd_type="$_lsd_value"
+        fi
+
+        # Answered by the line just read, in either form: the inline table carries both fields
+        # on one line, and in the block form these are the two the search is for. Nothing left
+        # in the file could change the answer — and in particular the *next* component's source
+        # must not, which is what the section tracking above is for.
+        if [ -n "$_lsd_path" ] && [ -n "$_lsd_type" ]; then
+            break
+        fi
+    done < "$_lsd_config"
+
+    [ "$_lsd_type" = "local_dir" ] || return 1
+    [ -n "$_lsd_path" ] || return 1
+    printf '%s\n' "$_lsd_path"
+}
+
+# Is the drop directory actually carrying a release?
+#
+# Checked before `updaterd` is fetched, because the engine's own answer for an empty or missing
+# directory (`no manifests in /var/lib/robot/sideload`, or an ENOENT on the opendir) names the
+# directory and nothing else. The person reading it is at a bare board that was just flashed,
+# does not know this file exists, and has no way to guess that the fix is copying four files
+# into it. So this says which path, what was looked for, and what the layout is —
+# `updater::source::local`'s, which `dev-push.sh` produces and whose absence
+# `xtask/tests/sideload.rs` covers.
+#
+# Deliberately not a manifest parse: the signatures and the hash are the engine's job, and a
+# shell script reading JSON would be a second, weaker reader of a signed document — the same
+# reason this script never learns the version from a manifest. Requiring the two manifest
+# files is the claim "there is something here to try"; everything after that is `updaterd`'s.
+#
+# Answers with an exit status and says why on stderr, rather than `die`ing itself: a `die` in
+# here would end the process from inside a function whose only job is to answer a question, and
+# the caller — `require_local_source` below — is what has to stop the install.
+local_source_ready() {
+    _lsr_dir="$1"
+    if [ ! -d "$_lsr_dir" ]; then
+        printf '\033[31merror:\033[0m %s\n' "the config takes releases from ${_lsr_dir}, and it does not exist.
+  On a board being provisioned that directory is where the release is supposed to be, because
+  this robot has no host to fetch one from: ${CONFIG_DIR}/updater.toml names it as a
+  \`local_dir\` source.
+  Copy a signed release onto the board first, then run this again:
+    sudo mkdir -p ${_lsr_dir}
+    sudo scripts/dev-push.sh --bootstrap <board>     # or: scp dist/* ${_lsr_dir}/" >&2
+        return 1
+    fi
+
+    # Any version will do, not the newest: `updaterd install --from` resolves `latest` off the
+    # same directory, and this is only asking whether it has anything to resolve. `[0-9]*` is
+    # the cheap filter for a version-shaped stem — the engine parses these names with semver,
+    # which shell cannot do, and a stem it then refuses is a diagnosis, not a false negative.
+    _lsr_manifest=""
+    for _lsr_candidate in "${_lsr_dir}"/*.manifest.json; do
+        case "${_lsr_candidate##*/}" in
+            [0-9]*) _lsr_manifest="$_lsr_candidate"; break ;;
+        esac
+    done
+
+    if [ -z "$_lsr_manifest" ] || [ ! -f "$_lsr_manifest" ]; then
+        printf '\033[31merror:\033[0m %s\n' "${_lsr_dir} holds no release to install.
+  Expected the layout \`updaterd install --from\` reads, which is what \`scripts/dev-push.sh\`
+  leaves behind and what the release pipeline publishes:
+    ${_lsr_dir}/<version>.manifest.json
+    ${_lsr_dir}/<version>.manifest.json.minisig
+    ${_lsr_dir}/daemon-<version>.tar.zst
+    ${_lsr_dir}/daemon-<version>.tar.zst.minisig
+  Copy those four files (names as published — the artifact's name is the one the manifest's
+  \`url\` field carries) into ${_lsr_dir} and run this again." >&2
+        return 1
+    fi
+
+    if [ ! -f "${_lsr_manifest}.minisig" ]; then
+        printf '\033[31merror:\033[0m %s\n' "${_lsr_dir} has $(basename "$_lsr_manifest") but not its signature.
+  Every manifest is verified against ${KEYS_DIR} before anything is installed, so the missing
+  half cannot be worked around:
+    ${_lsr_manifest}.minisig
+  Copy it in with the manifest's own signature file from the release you sideloaded." >&2
+        return 1
+    fi
+}
+
+# The same check, as a fatal one. Split rather than merged because the exit status is what a
+# test can ask about without ending a shell, and `die` is what an install needs — `die`'s own
+# message is the last line, so the diagnosis printed above it is not swallowed.
+require_local_source() {
+    local_source_ready "$1" || die "cannot install the first release from the config's local_dir source."
 }
 
 # Stop the daemons so a forced re-install is operating on an inert board.
@@ -426,12 +606,37 @@ EOF
     # shellcheck disable=SC2064 # expand $tmp now, deliberately
     trap "rm -rf '$tmp'" EXIT INT TERM
 
+    # Which source the *installed* config names, which is what decides where the release is read
+    # from. The shipped `deploy/updater.toml` is a `local_dir` with no `check_interval`: this
+    # robot is configured never to take a release off a network, and a bootstrap that let the
+    # engine resolve `latest` over the API anyway would be this script undoing that decision at
+    # exactly the moment nobody is watching it. Empty means "not a local directory", which covers
+    # every other source and leaves the old path byte for byte.
+    from_dir="$(local_source_dir || true)"
+
+    # Fetched on both paths, and deliberately: `resolve_bootstrap_asset` is what learns the tag
+    # whose config this run pairs with (see `install_config`), and the binary it downloads is
+    # verified against the release's own `bin/updaterd` a few lines below whatever source the
+    # release came from. What a local source changes is only where the *release payload* is read
+    # from — not how it is verified, and not whether this script has an updater to verify it with.
+    # That is the whole residual egress on this path, and it is the same one the header describes
+    # for a board with no config at all.
     say "fetching the bootstrap updaterd"
     resolve_bootstrap_asset
     if ! fetch_asset "$BOOTSTRAP_URL" "${tmp}/updaterd"; then
         die "cannot fetch ${BOOTSTRAP_URL}"
     fi
     chmod +x "${tmp}/updaterd"
+
+    # `--from` is the engine's own offline path, and the header says so: the same engine, the
+    # same signature check, the same extraction — only the bytes' origin differs. One argument,
+    # `--from=DIR`, so a path with a space in it cannot become two arguments.
+    from_flag=""
+    if [ -n "$from_dir" ]; then
+        require_local_source "$from_dir"
+        say "installing the first release from ${from_dir} (the config's local_dir source)"
+        from_flag="--from=${from_dir}"
+    fi
 
     say "installing the first release (verifying signatures)"
     # GITHUB_TOKEN, not DUCK_TOKEN: the engine reads that name, and it needs one for the
@@ -448,9 +653,9 @@ EOF
         force_flag="--force"
     fi
 
-    # shellcheck disable=SC2086 # unquoted so an empty force_flag passes no argument at all
+    # shellcheck disable=SC2086 # unquoted so an empty flag passes no argument at all
     GITHUB_TOKEN="$TOKEN" "${tmp}/updaterd" install \
-        --config "${CONFIG_DIR}/updater.toml" $force_flag
+        --config "${CONFIG_DIR}/updater.toml" $from_flag $force_flag
 
     if [ ! -L "${INSTALL_DIR}/current" ]; then
         die "the install reported success but nothing is live"
@@ -459,6 +664,12 @@ EOF
     # Close the loop on the one unverified download. The installed binary came out of a
     # signature-verified artifact; if the bootstrap binary matches it byte for byte, the
     # bootstrap binary was genuine too.
+    #
+    # Checked on the local path as well, and the failure reads differently enough there to be
+    # worth stating: the sideloaded artifact need not be the build the published bootstrap
+    # came from, so a mismatch there is usually somebody installing their own build over a
+    # released installer rather than a compromised download. It is still fatal — silently
+    # *not* checking when `--from` is used is the failure this whole step exists to prevent.
     boot_sum="$(sha256sum "${tmp}/updaterd" | cut -d' ' -f1)"
     installed_sum="$(sha256sum "${INSTALL_DIR}/current/bin/updaterd" | cut -d' ' -f1)"
     if [ "$boot_sum" != "$installed_sum" ]; then
@@ -466,7 +677,10 @@ EOF
   bootstrap: ${boot_sum}
   installed: ${installed_sum}
   The installed release is signed and safe, but the binary that installed it was not the
-  one this release contains. Treat that as a compromised download and investigate."
+  one this release contains. Treat that as a compromised download and investigate.
+  If the release came from a ${from_dir:-configured source} you built yourself: the bootstrap
+  binary always comes from the published release, so a sideloaded build must contain the same
+  updaterd as that release to satisfy this check."
     fi
     say "bootstrap binary verified against the signed release"
 
@@ -1086,4 +1300,14 @@ main() {
 # Called on the last line so a truncated download — the real failure mode of
 # `curl | sh` — defines functions and then does nothing, rather than running half an
 # install.
-main "$@"
+#
+# The test hook below is the same idea in reverse: `scripts/board-test.sh` sources this file
+# to reach the two functions that decide *where* the first release comes from, which is the
+# part of the local-source path that can be checked without a board. Reading them out of this
+# file with `sed` instead would be a second copy that drifts, and a full `main` in a container
+# that has no network and no board is not a test of anything. Named for what it does rather
+# than after its caller, and nothing but a test may set it: the guard is checked before
+# `main`, never inside it.
+if [ -z "${DUCK_INSTALL_LIB_ONLY:-}" ]; then
+    main "$@"
+fi

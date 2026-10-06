@@ -45,10 +45,14 @@ NET_CHECK_UNIT=/etc/systemd/system/robot-net-check.service
 SELF=/usr/local/sbin/robot-migrate-network
 
 # Where this script came from, for the commands it prints. Same override names as install.sh
-# and setup-board.sh, so a fork or a pinned tag is one decision for the whole bring-up.
+# and setup-board.sh, so a fork or a pinned tag is one decision for the whole bring-up —
+# `DUCK_GITHUB_RAW` included: the commands printed below fetch this script again after the
+# reboot it asks for, and a machine that can only reach a mirror must not be handed a
+# github.com URL to paste. Default is the public host, byte for byte.
 REPO="${DUCK_REPO:-pollen-robotics/microduck}"
 REF="${DUCK_REF:-main}"
-RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+GITHUB_RAW="${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}"
+RAW="${GITHUB_RAW%/}/${REPO}/${REF}/scripts"
 # For a private repository. Only ever interpolated into printed commands, and by name rather
 # than by value: a bring-up log gets pasted into chat.
 TOKEN="${DUCK_TOKEN:-}"

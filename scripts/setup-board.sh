@@ -85,9 +85,20 @@ SELF=/usr/local/sbin/robot-setup-board
 # Where the sibling scripts come from, for the commands this prints. Same override names as
 # `install.sh`, so a fork or a pinned tag is one decision for the whole bring-up rather than
 # per script. Nothing here is fetched by this script — see `fetch_cmd`.
+#
+# `DUCK_GITHUB_RAW` included for the same reason: the commands this prints are what the
+# operator pastes, and on a machine that can only reach a mirror the printed URL is the one
+# thing that has to be right. Default is the public host, byte for byte.
 REPO="${DUCK_REPO:-pollen-robotics/microduck}"
 REF="${DUCK_REF:-main}"
-RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+GITHUB_RAW="${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}"
+RAW="${GITHUB_RAW%/}/${REPO}/${REF}/scripts"
+
+# The web host `releases/download` URLs live on, which is GitHub by default and a mirror's own
+# name when one fronts the repository. Separate from `DUCK_GITHUB_RAW` because a mirror may
+# serve raw content and release assets from different names — the same split the daemon's
+# config makes with `api_base`/`download_base`.
+GITHUB_DOWNLOAD="${DUCK_GITHUB_DOWNLOAD:-https://github.com}"
 
 # For a private repository: a token with read access to contents. Only ever interpolated into
 # the commands this prints, and by name (`$DUCK_TOKEN`) rather than by value — a bring-up log
@@ -306,7 +317,7 @@ install_onnxruntime() {
         say "replacing ONNX Runtime ${existing} with ${ONNX_VERSION}"
     fi
 
-    url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz"
+    url="${GITHUB_DOWNLOAD%/}/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz"
     tmp="$(mktemp -d)"
     say "installing ONNX Runtime ${ONNX_VERSION}"
 

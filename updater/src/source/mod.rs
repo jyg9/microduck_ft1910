@@ -16,9 +16,20 @@ mod hf_hub;
 pub mod http;
 mod local;
 
-pub use github::GithubReleases;
+pub use github::{GithubReleases, Hosts};
 pub use hf_hub::HfHub;
 pub use local::LocalDir;
+
+/// A configured base URL with any trailing slash removed.
+///
+/// Every base here is used as `format!("{base}/rest/of/path")`, so a base written the way
+/// half of everyone writes a host — `https://github.com/` — produces
+/// `https://github.com//repos/…`. A server reads that as a different path, so the request
+/// 404s while the config looks right. The slack is taken here rather than left to be found
+/// in a debug log.
+pub(crate) fn trim_base(base: &str) -> String {
+    base.trim_end_matches('/').to_owned()
+}
 
 /// Reports download progress as `(bytes_so_far, total_if_known)`.
 ///
@@ -115,21 +126,26 @@ pub fn from_config(config: &SourceConfig) -> Box<dyn Source> {
             manifest_asset,
             ref_tag_prefix,
             staging_tag_prefix,
+            api_base,
+            download_base,
         } => Box::new(GithubReleases::new(
             repo.clone(),
             tag_prefix.clone(),
             manifest_asset.clone(),
             ref_tag_prefix.clone(),
             staging_tag_prefix.clone(),
+            Hosts::new(api_base.clone(), download_base.clone()),
         )),
         SourceConfig::HfHub {
             repo,
             revision,
             manifest_file,
+            endpoint,
         } => Box::new(HfHub::new(
             repo.clone(),
             revision.clone(),
             manifest_file.clone(),
+            endpoint.clone(),
         )),
         SourceConfig::LocalDir { path } => Box::new(LocalDir::new(path.clone())),
     }

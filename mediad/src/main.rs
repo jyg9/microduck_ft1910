@@ -42,7 +42,17 @@ struct Args {
     /// Defaults to the Space the mini's fleet uses. A flag rather than a config key because there
     /// is nothing to choose on a real robot — what it is for is pointing a board at a fake, or at
     /// a self-hosted copy on the day somebody wants one. `docs/design/remote-access-design.md` §4.
-    #[arg(long, default_value = mediad::relay::DEFAULT_RENDEZVOUS)]
+    ///
+    /// **Also readable from the environment, which is the form that survives an update.** The
+    /// release installer rewrites `mediad.service` — it owns that file, and a systemd drop-in is
+    /// where an edit to it is supposed to go — so a deployment that re-points this has to say so
+    /// somewhere the installer does not overwrite. `systemctl edit mediad` with an
+    /// `Environment=` line is that place, and it is why this is `DUCK_RENDEZVOUS_URL` rather than
+    /// a second flag nobody would find.
+    ///
+    /// Precedence is clap's: the flag if given, else the environment, else the default above.
+    #[arg(long, env = "DUCK_RENDEZVOUS_URL",
+          default_value = mediad::relay::DEFAULT_RENDEZVOUS)]
     rendezvous_url: String,
 
     /// The account credential `updaterd` writes, which the relay needs to prove whose robot this
@@ -57,8 +67,15 @@ struct Args {
     /// pointing a board at a fake; there is nothing to choose on a real one.
     ///
     /// Checked here rather than trusted: this is the one URL the account token is sent to, and
-    /// `parse_endpoint` says what it will not send it over.
-    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT,
+    /// `parse_endpoint` says what it will not send it over. **The environment form is checked
+    /// too** — clap runs `value_parser` on whatever it resolves, so `DUCK_TURN_URL` cannot
+    /// smuggle in the plain `http` the flag refuses.
+    ///
+    /// `DUCK_TURN_URL` for `DUCK_RENDEZVOUS_URL`'s reason: this is the address the account token
+    /// is sent to, so a private deployment that runs its own proxy must be able to say so
+    /// somewhere an update does not overwrite.
+    #[arg(long, env = "DUCK_TURN_URL",
+          default_value = mediad::turn::DEFAULT_TURN_ENDPOINT,
           value_parser = mediad::turn::parse_endpoint)]
     turn_url: String,
 

@@ -268,6 +268,25 @@ pub enum SourceConfig {
         /// "unless…" would put the fleet one config typo away from tracking candidates.
         #[serde(default = "default_staging_tag_prefix")]
         staging_tag_prefix: String,
+        /// The GitHub API host, without a trailing slash.
+        ///
+        /// Defaulted so that naming nothing keeps the public service, byte for byte: a robot
+        /// that must not reach it — one on a private network, or one whose owner does not want
+        /// its address in someone else's access log — points this at its own mirror with config
+        /// alone rather than by building a fork of this crate.
+        #[serde(default = "default_github_api_base")]
+        api_base: String,
+        /// The host a release's own `download/...` URLs name, without a trailing slash.
+        ///
+        /// Separate from [`Self::api_base`] because it answers a different question. The API
+        /// host is where *this daemon* sends its requests; this one is what the *manifest*
+        /// wrote down, and it is what `source::github::GithubReleases` matches to recognise its
+        /// own artifacts and re-resolve them through the API — which is the only way a private
+        /// repository's `releases/download/...` URL is fetchable at all. It must therefore be
+        /// the host the publishing CI actually used; a mirror that serves the bytes under a
+        /// different name is not something this field can paper over.
+        #[serde(default = "default_github_download_base")]
+        download_base: String,
     },
     HfHub {
         /// `ORG/MODEL`.
@@ -276,6 +295,10 @@ pub enum SourceConfig {
         revision: String,
         #[serde(default = "default_manifest_asset")]
         manifest_file: String,
+        /// The Hub host, without a trailing slash. Defaulted, for [`Self::GithubReleases`]'s
+        /// `api_base` reason.
+        #[serde(default = "default_hf_endpoint")]
+        endpoint: String,
     },
     /// A local directory. Not a production source — this is what makes the
     /// engine testable against the real code path with no network, and backs
@@ -298,6 +321,26 @@ fn default_staging_tag_prefix() -> String {
 
 fn default_manifest_asset() -> String {
     "manifest.json".to_owned()
+}
+
+/// The public GitHub API.
+///
+/// Stated here rather than in `source/github.rs` because it is a property of the *schema*: it
+/// is what an absent `api_base` means, and the only reader that can leave it absent is serde.
+/// A test in this module pins it against the literal the source layer's URL tests use, so the
+/// two cannot drift into agreeing on a wrong value.
+fn default_github_api_base() -> String {
+    "https://api.github.com".to_owned()
+}
+
+/// The public GitHub download host — where `releases/download/...` URLs point.
+fn default_github_download_base() -> String {
+    "https://github.com".to_owned()
+}
+
+/// The public Hugging Face Hub.
+fn default_hf_endpoint() -> String {
+    "https://huggingface.co".to_owned()
 }
 
 /// What to do once the new release is linked.
@@ -640,9 +683,12 @@ mod tests {
     ///
     /// Every one of these is a single word or `true`/`false` away from being wrong in a way
     /// no diff makes obvious: a robot that trusts dev keys, one that can be told to fail on
-    /// purpose, one that never polls and so can never be pulled off a withdrawn release, or
-    /// one whose update gate does not gate. All four look fine and behave fine right up to
-    /// the moment they matter.
+    /// purpose, one that reaches a public host unattended, or one whose update gate does not
+    /// gate. All four look fine and behave fine right up to the moment they matter.
+    ///
+    /// The egress one is the reason this file differs from `updater.example.toml` at all: the
+    /// example describes the mechanism a fleet robot wants, and this file is a robot that is
+    /// not on that fleet.
     #[test]
     fn shipped_config_is_safe_for_a_client_robot() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -660,10 +706,16 @@ mod tests {
             !config.allow_fault_injection,
             "a client robot must not accept --inject-fault"
         );
+        // **Absent, and this is the load-bearing line of the whole file.** The periodic check
+        // is the only thing this robot does without being asked, and it is an outbound request
+        // to a host we do not run. Losing it costs `min_supported`: a withdrawn release is
+        // noticed when somebody asks rather than on its own. That is the trade a standalone
+        // robot makes, and it is the opposite of the trade a fleet robot makes — which is why
+        // the example keeps a `check_interval` and this file does not.
         assert!(
-            config.check_interval.is_some(),
-            "without a check interval `min_supported` is inert, so a withdrawn release \
-             cannot be remediated on a robot nobody opens the app for"
+            config.check_interval.is_none(),
+            "the shipped config must not poll: the periodic check is the one request this \
+             robot makes with nobody watching"
         );
         // Numeric ids never belong in a shipped config: sysusers allocates dynamically, so a
         // number that is right on one board is wrong on the next. Names are resolved at startup.
@@ -709,12 +761,15 @@ mod tests {
             "change authority is granted to named services, not to groups: {:?}",
             config.allow_groups
         );
-        assert_ne!(
+        // Narrower than "not `all`": nothing here may install a release without a person
+        // asking. There is no channel this robot trusts enough to take one from unattended, and
+        // with no `check_interval` above there is no timer that could run it anyway — asserted
+        // both ways so that restoring one without the other is a test failure rather than a
+        // robot that restarts on its own.
+        assert_eq!(
             config.auto_apply,
-            AutoApply::All,
-            "a client robot must not install every release unattended: when it restarts is \
-             its owner's decision, which is what the app-driven flow exists to give them. \
-             `all` is the canary and bench setting."
+            AutoApply::Off,
+            "the shipped config must apply nothing unattended"
         );
 
         let daemon = config
@@ -740,49 +795,153 @@ mod tests {
             daemon.health
         );
 
-        // The stable channel, not staging. A robot on `daemon-staging-v` would install
-        // every candidate build.
-        let SourceConfig::GithubReleases {
-            tag_prefix,
-            staging_tag_prefix,
-            ..
-        } = &daemon.source
-        else {
+        // **Locally-sideloaded signed releases, and no host at all.** A `github_releases` source
+        // here would be a standing egress to a public host on a robot that is not on the
+        // manufacturer's fleet — and every mechanism that matters is indifferent to which source
+        // produced the bytes: a sideloaded artifact is verified exactly like a downloaded one
+        // (signature, not a skipped check), and the health gate, golden release and rollback all
+        // run on the result. This is the assertion that keeps a later edit from quietly
+        // restoring the public channel.
+        //
+        // There is no `tag_prefix`/`staging_tag_prefix` to assert any more, and that is the
+        // intended change rather than an omission: a directory has no channels, so `--staging`
+        // against it refuses by name (`source/local.rs`) instead of resolving a candidate.
+        let SourceConfig::LocalDir { path } = &daemon.source else {
             panic!(
-                "the shipped daemon source must be github_releases, got {:?}",
+                "the shipped daemon source must be a local_dir so this robot makes no \
+                 outbound request, got {:?}",
                 daemon.source
             );
         };
-        assert_eq!(
-            tag_prefix, "daemon-v",
-            "the shipped config must track the stable channel"
+        assert!(
+            path.is_absolute(),
+            "a relative drop directory would resolve against updaterd's working directory, \
+             which systemd does not guarantee: {}",
+            path.display()
         );
-        // The shipped config names no staging prefix, so `--staging` on a customer robot
-        // depends on this default matching what `release.yml` actually pushes. A wrong
-        // default would fail with "no releases with tag prefix", which reads as "there is no
-        // candidate" rather than "this board is looking in the wrong place".
+
+        // One component, because a second would be one nobody has shipped — and a source that
+        // cannot answer makes every `check` report a failure, which teaches whoever reads robot
+        // status to ignore failures.
+        //
+        // The daemon's directory may be empty on a robot nobody has sideloaded to, and a check
+        // against it then fails with "no manifests in <dir>". That is the honest answer — there
+        // is nothing to install — and it is not noise, because nothing polls: it is only ever
+        // said to somebody who asked.
+        assert_eq!(
+            config.components.keys().collect::<Vec<_>>(),
+            vec!["daemon"],
+            "the shipped config should carry only the component this robot actually runs"
+        );
+    }
+
+    /// A config that names none of the defaulted source fields, so what they come back as is the
+    /// schema's answer rather than a file's.
+    ///
+    /// Shared by the two tests below rather than written twice, because "which fields are
+    /// optional" is one fact and a second copy would be a second place for it to be wrong.
+    const NO_OPTIONAL_SOURCE_FIELDS: &str = r#"
+trusted_keys_dir = "/etc/robot/trusted_keys"
+state_dir = "/var/lib/robot/updater"
+
+[component.daemon]
+install_dir = "/opt/robot/daemon"
+
+[component.daemon.source]
+type       = "github_releases"
+repo       = "ORG/duck-daemon"
+tag_prefix = "daemon-v"
+
+[component.daemon.on_apply]
+action = "restart"
+units  = ["robotd"]
+
+[component.models]
+install_dir = "/opt/robot/model/walk"
+
+[component.models.source]
+type     = "hf_hub"
+repo     = "ORG/gait-model"
+revision = "main"
+
+[component.models.on_apply]
+action = "none"
+"#;
+
+    /// **Naming no host keeps the public one, which is what makes the fields additive.**
+    ///
+    /// The three values are asserted against literals that also appear in the source layer's URL
+    /// tests, and deliberately not read from a shared constant: one constant would satisfy both
+    /// sides of the contract while being wrong in the one place that matters, which is the request
+    /// a robot that configured nothing actually sends.
+    ///
+    /// The failure this prevents is silent in both directions — a default that drifts sends a
+    /// robot to a host nobody configured, and a field that stopped being defaulted turns every
+    /// existing `updater.toml` into a parse error on the next boot.
+    #[test]
+    fn a_source_with_no_host_named_keeps_the_public_one() {
+        let config =
+            Config::from_toml(NO_OPTIONAL_SOURCE_FIELDS).expect("naming no host must still load");
+
+        let SourceConfig::GithubReleases {
+            api_base,
+            download_base,
+            ..
+        } = &config.component("daemon").unwrap().source
+        else {
+            panic!("the daemon source here is a github_releases source");
+        };
+        assert_eq!(api_base, "https://api.github.com");
+        assert_eq!(download_base, "https://github.com");
+
+        let SourceConfig::HfHub { endpoint, .. } = &config.component("models").unwrap().source
+        else {
+            panic!("the model source here is an hf_hub source");
+        };
+        assert_eq!(endpoint, "https://huggingface.co");
+    }
+
+    /// **The channel prefixes default to what the workflows actually push.**
+    ///
+    /// A `github_releases` source that names no prefix depends on these three strings matching
+    /// `.github/workflows/`: `daemon-v` from `_build-release.yml` and `_promote-release.yml`,
+    /// `daemon-staging-v` from the candidate path, `daemon-dev-` from `dev.yml`. A wrong default
+    /// does not fail loudly — it reports "no releases with tag prefix", which reads as "there is
+    /// no candidate" rather than as "this board is looking in the wrong place", so the two are
+    /// pinned together here where a change to either is one diff.
+    ///
+    /// No longer asserted against `deploy/updater.toml`, because that file's source is a local
+    /// directory now and a directory has no channels. The contract is with the workflows, so this
+    /// is where it belongs rather than in the shipped-config test it used to live in.
+    #[test]
+    fn the_channel_prefixes_default_to_what_the_workflows_push() {
+        let config =
+            Config::from_toml(NO_OPTIONAL_SOURCE_FIELDS).expect("naming no prefix must still load");
+        let SourceConfig::GithubReleases {
+            ref_tag_prefix,
+            staging_tag_prefix,
+            ..
+        } = &config.component("daemon").unwrap().source
+        else {
+            panic!("the daemon source here is a github_releases source");
+        };
+        assert_eq!(ref_tag_prefix, "daemon-dev-");
         assert_eq!(
             staging_tag_prefix, "daemon-staging-v",
             "the default candidate prefix must match the tag release.yml pushes"
         );
-
-        // Only components that have somewhere real to fetch from. A component whose
-        // source 404s makes the periodic check report a failure for something nobody has
-        // shipped, which teaches whoever reads robot status to ignore failures.
-        assert_eq!(
-            config.components.keys().collect::<Vec<_>>(),
-            vec!["daemon"],
-            "the shipped config should carry only components whose source exists"
-        );
     }
 
-    /// The placeholder in `deploy/updater.toml` must be recognisable as one.
+    /// Wherever a placeholder repository is named, `scripts/install.sh`'s guard must recognise it.
     ///
-    /// `scripts/install.sh` refuses to install a config still containing `ORG/`, so that a
-    /// robot cannot be provisioned pointing at a repository that does not exist — which
-    /// would install fine and then never find another update. This test exists so that
-    /// substituting the real repo does not silently break that guard by, say, leaving the
-    /// literal in a comment where the script would still match it.
+    /// `scripts/install.sh` refuses to install a config still containing `ORG/`, so a robot
+    /// cannot be provisioned pointing at a repository that does not exist — which would install
+    /// fine and then never find another update. The shipped config names no repository today (its
+    /// source is a local directory), so the branch that matters here is the other one: the guard
+    /// must survive in the script for boards provisioned before that, and for anyone who puts a
+    /// GitHub source back. Where a placeholder does appear it must be the `repo` value and not
+    /// stray text — say, the literal left behind in a comment, which the script's `grep` would
+    /// match and its `sed` would not fix.
     #[test]
     fn installer_guard_and_shipped_config_agree_about_the_placeholder() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

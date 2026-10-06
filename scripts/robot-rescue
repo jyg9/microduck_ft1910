@@ -89,7 +89,14 @@ say() {
     echo "robot-rescue: $*" >&2
     # The journal is where an operator looks after the fact, and after a reboot it is the only
     # place left. Optional because a board without `logger` must still be rescuable.
-    command -v logger >/dev/null 2>&1 && logger -t robot-rescue "$*"
+    #
+    # The `{ ...; } || true` is load-bearing under `set -e`, and so is the `return 0` below:
+    # without the braces this was `command -v logger && logger ...`, and in an environment where
+    # `logger` exists but has no /dev/log to write to, that failing chain *is* the function's
+    # exit status. The rescue then died at its own first line, before `decline` could exit 2 —
+    # which is the answer this script exists to give. `xtask/tests/rescue.rs` on a host with no
+    # syslog socket is what found it.
+    { command -v logger >/dev/null 2>&1 && logger -t robot-rescue "$*"; } || true
     return 0
 }
 

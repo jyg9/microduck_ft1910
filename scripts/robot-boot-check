@@ -73,7 +73,11 @@ done
 
 say() {
     echo "robot-boot-check: $*" >&2
-    command -v logger >/dev/null 2>&1 && logger -t robot-boot-check "$*"
+    # Same shape as `robot-rescue`'s, and for the same reason: this script runs under `set -e`,
+    # and in an environment where `logger` exists but cannot write — no /dev/log in a container —
+    # the failing command would become `say`'s own exit status and end the check. The journal is
+    # where an operator looks after the fact; it is not worth failing a boot recovery net over.
+    { command -v logger >/dev/null 2>&1 && logger -t robot-boot-check "$*"; } || true
     return 0
 }
 

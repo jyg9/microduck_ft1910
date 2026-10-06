@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::Error;
 use crate::manifest::Manifest;
-use crate::source::{FetchedArtifact, ProgressSink, SignedBytes, Source, http};
+use crate::source::{FetchedArtifact, ProgressSink, SignedBytes, Source, http, trim_base};
 
 /// Releases fetched per page when scanning for the newest tag. One page is plenty
 /// for any real channel; further pages are fetched only if a page comes back full.
@@ -30,12 +30,40 @@ const SIG_SUFFIX: &str = ".minisig";
 /// What the release-asset API needs to return bytes rather than JSON metadata.
 const OCTET_STREAM: &str = "application/octet-stream";
 
+/// Where a GitHub Releases source talks to.
+///
+/// Two hosts rather than one base because they are two services: `api` answers metadata and
+/// serves a private release's assets, while `download` is the host a *manifest's own* `url`
+/// names. A mirror can reasonably serve one and proxy the other, and keeping them apart is
+/// what lets `split_release_url` recognise our own download URLs on a host that is not
+/// github.com — the recognition that makes a private repository's artifacts fetchable at all.
+///
+/// Configured so that a robot which must not reach the public service can be pointed at a
+/// private one with config alone. Defaults live in `crate::config`, where every other
+/// schema default lives, so a robot that names neither field sends exactly the URLs it
+/// sent before these existed.
+#[derive(Debug, Clone)]
+pub struct Hosts {
+    api: String,
+    download: String,
+}
+
+impl Hosts {
+    pub fn new(api: impl Into<String>, download: impl Into<String>) -> Self {
+        Self {
+            api: trim_base(&api.into()),
+            download: trim_base(&download.into()),
+        }
+    }
+}
+
 pub struct GithubReleases {
     repo: String,
     tag_prefix: String,
     manifest_asset: String,
     ref_tag_prefix: String,
     staging_tag_prefix: String,
+    hosts: Hosts,
     client: reqwest::Client,
 }
 
@@ -73,6 +101,7 @@ impl GithubReleases {
         manifest_asset: String,
         ref_tag_prefix: String,
         staging_tag_prefix: String,
+        hosts: Hosts,
     ) -> Self {
         Self {
             repo,
@@ -80,11 +109,38 @@ impl GithubReleases {
             ref_tag_prefix,
             staging_tag_prefix,
             manifest_asset,
+            hosts,
             // A failure here means a broken TLS setup, which is fatal for every
             // request anyway; fall back to a default client so construction stays
             // infallible and the error surfaces on first use.
             client: http::client().unwrap_or_default(),
         }
+    }
+
+    /// The API URL answering "the release published under this tag".
+    fn release_by_tag_url(&self, tag: &str) -> String {
+        format!("{}/repos/{}/releases/tags/{tag}", self.hosts.api, self.repo)
+    }
+
+    /// The API URL answering "this release", identified by its numeric id.
+    fn release_by_id_url(&self, id: u64) -> String {
+        format!("{}/repos/{}/releases/{id}", self.hosts.api, self.repo)
+    }
+
+    /// One page of the release listing.
+    fn releases_page_url(&self, page: usize) -> String {
+        format!(
+            "{}/repos/{}/releases?per_page={PER_PAGE}&page={page}",
+            self.hosts.api, self.repo
+        )
+    }
+
+    /// The prefix one of *our* release-download URLs carries.
+    ///
+    /// Mirrors [`Self::split_release_url`], which is the only reader, so the two cannot
+    /// drift: a prefix built one way and matched another is a private artifact that 404s.
+    fn download_prefix(&self) -> String {
+        format!("{}/{}/releases/download/", self.hosts.download, self.repo)
     }
 
     fn tag_for(&self, version: &semver::Version) -> String {
@@ -114,19 +170,13 @@ impl GithubReleases {
     /// every time. The second request costs nothing on a release that really is empty, and it
     /// is what makes [`Error::ReleaseNotReady`] mean what it says.
     async fn release_for_tag(&self, tag: &str) -> Result<Release, Error> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/tags/{tag}",
-            self.repo
-        );
+        let url = self.release_by_tag_url(tag);
         let release = self.release_at(&url, tag).await?;
         if !release.assets.is_empty() {
             return Ok(release);
         }
 
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/{}",
-            self.repo, release.id
-        );
+        let url = self.release_by_id_url(release.id);
         tracing::debug!(%tag, id = release.id, "tag lookup listed no assets; asking by id");
         self.release_at(&url, tag).await
     }
@@ -174,10 +224,7 @@ impl GithubReleases {
         let mut best: Option<semver::Version> = None;
 
         for page in 1..=MAX_PAGES {
-            let url = format!(
-                "https://api.github.com/repos/{}/releases?per_page={PER_PAGE}&page={page}",
-                self.repo
-            );
+            let url = self.releases_page_url(page);
             let bytes =
                 http::get_bytes(&self.client, &url, Some("application/vnd.github+json")).await?;
             let releases: Vec<Release> = serde_json::from_slice(&bytes)
@@ -247,7 +294,7 @@ impl GithubReleases {
     /// because the manifest this comes from is unverified at that point, so a URL naming a
     /// foreign repo must not become an authenticated API request against it.
     fn split_release_url(&self, url: &str) -> Option<(String, String)> {
-        let prefix = format!("https://github.com/{}/releases/download/", self.repo);
+        let prefix = self.download_prefix();
         let (tag, name) = url.strip_prefix(&prefix)?.split_once('/')?;
         Some((tag.to_owned(), name.to_owned()))
     }
@@ -405,6 +452,15 @@ pub(crate) fn safe_file_name(url: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
 
+    /// The public hosts, as literals rather than read from `crate::config`'s defaults.
+    ///
+    /// The literals are the point. `crate::config` asserts that the serde defaults equal
+    /// these two strings and this asserts that these two strings build the URLs the daemon
+    /// has always sent; a single shared constant would let a typo satisfy both.
+    fn public_hosts() -> Hosts {
+        Hosts::new("https://api.github.com", "https://github.com")
+    }
+
     fn source() -> GithubReleases {
         GithubReleases::new(
             "ORG/robot-daemon".into(),
@@ -412,7 +468,120 @@ mod tests {
             "manifest.json".into(),
             "daemon-dev-".into(),
             "daemon-staging-v".into(),
+            public_hosts(),
         )
+    }
+
+    /// **A robot that configures no host sends exactly the URLs it sent before the fields
+    /// existed.**
+    ///
+    /// Each of the four is a request this daemon makes. They are asserted as whole strings
+    /// because the failure they guard is a default that drifts: it is invisible in a config
+    /// file that never names the field, and on a board it surfaces as an update that never
+    /// arrives rather than as anything about a host.
+    #[test]
+    fn the_public_hosts_build_exactly_the_historic_urls() {
+        let s = source();
+        assert_eq!(
+            s.release_by_tag_url("daemon-v1.4.2"),
+            "https://api.github.com/repos/ORG/robot-daemon/releases/tags/daemon-v1.4.2"
+        );
+        assert_eq!(
+            s.release_by_id_url(7),
+            "https://api.github.com/repos/ORG/robot-daemon/releases/7"
+        );
+        assert_eq!(
+            s.releases_page_url(2),
+            "https://api.github.com/repos/ORG/robot-daemon/releases?per_page=100&page=2"
+        );
+        assert_eq!(
+            s.download_prefix(),
+            "https://github.com/ORG/robot-daemon/releases/download/"
+        );
+    }
+
+    /// **A configured host is where the request actually goes.**
+    ///
+    /// The whole reason the field exists is a robot that must not reach the public service,
+    /// so a base that were echoed into a log but not into the URL would read as configured
+    /// and egress anyway. The two hosts differ here on purpose: one value serving both would
+    /// hide a `format!` that reached for the wrong field.
+    #[test]
+    fn a_configured_host_replaces_the_public_one_in_every_url() {
+        let s = GithubReleases::new(
+            "ORG/robot-daemon".into(),
+            "daemon-v".into(),
+            "manifest.json".into(),
+            "daemon-dev-".into(),
+            "daemon-staging-v".into(),
+            Hosts::new("https://gh.internal/api/v3", "https://gh.internal/dl"),
+        );
+
+        assert_eq!(
+            s.release_by_tag_url("daemon-v1.4.2"),
+            "https://gh.internal/api/v3/repos/ORG/robot-daemon/releases/tags/daemon-v1.4.2"
+        );
+        assert_eq!(
+            s.release_by_id_url(7),
+            "https://gh.internal/api/v3/repos/ORG/robot-daemon/releases/7"
+        );
+        assert_eq!(
+            s.releases_page_url(1),
+            "https://gh.internal/api/v3/repos/ORG/robot-daemon/releases?per_page=100&page=1"
+        );
+        assert_eq!(
+            s.download_prefix(),
+            "https://gh.internal/dl/ORG/robot-daemon/releases/download/"
+        );
+
+        // Recognition of our own download URLs follows the configured host, because it is
+        // matching rather than guessing — and that is what makes a private repository's
+        // artifacts fetchable, since their `releases/download/...` URLs 404 even with a token.
+        assert_eq!(
+            s.split_release_url(
+                "https://gh.internal/dl/ORG/robot-daemon/releases/download/daemon-v1.4.2/daemon-1.4.2.tar.zst"
+            ),
+            Some((
+                "daemon-v1.4.2".to_owned(),
+                "daemon-1.4.2.tar.zst".to_owned()
+            ))
+        );
+        // The public host is now somebody else's, and `resolve_download` runs before the
+        // manifest's signature is checked — so treating it as ours would aim an
+        // authenticated API request at a URL an unverified manifest chose.
+        assert_eq!(
+            s.split_release_url(
+                "https://github.com/ORG/robot-daemon/releases/download/daemon-v1.4.2/x.tar.zst"
+            ),
+            None
+        );
+    }
+
+    /// **A base written with a trailing slash does not become a doubled slash.**
+    ///
+    /// `https://github.com/` is how half of everyone writes a host, and `format!("{base}/repos…")`
+    /// turns that into `https://github.com//repos/…`. A server reads the doubled slash as a
+    /// different path, so the request 404s while the config file looks right — and the only
+    /// symptom is `no releases in ORG/… with tag prefix "daemon-v"`, which names neither the
+    /// slash nor the field that carried it.
+    #[test]
+    fn a_trailing_slash_on_a_configured_host_is_not_doubled() {
+        let s = GithubReleases::new(
+            "ORG/robot-daemon".into(),
+            "daemon-v".into(),
+            "manifest.json".into(),
+            "daemon-dev-".into(),
+            "daemon-staging-v".into(),
+            Hosts::new("https://gh.internal/", "https://gh.internal//"),
+        );
+        assert_eq!(
+            s.release_by_tag_url("t"),
+            "https://gh.internal/repos/ORG/robot-daemon/releases/tags/t"
+        );
+        assert_eq!(
+            s.download_prefix(),
+            "https://gh.internal/ORG/robot-daemon/releases/download/"
+        );
     }
 
     #[test]

@@ -482,7 +482,13 @@ install_plugins() {
     fi
 
     name="microduck-gst-plugins-${PLUGINS_VERSION}-aarch64"
-    base="https://github.com/${PLUGINS_REPO}/releases/download/${PLUGINS_VERSION}"
+    # The download host is a variable like everywhere else in this directory, and for a sharper
+    # reason here than most: the repository is deliberately public because this URL is fetched
+    # during provisioning *and later from the updater's preinstall hook*, which runs with a
+    # cleared environment. `PLUGINS_REPO` already moves the repository; `DUCK_GITHUB_DOWNLOAD`
+    # moves the host, for a mirror that fronts GitHub rather than carrying its own org.
+    # Default is the public host, byte for byte.
+    base="${DUCK_GITHUB_DOWNLOAD:-https://github.com}/${PLUGINS_REPO}/releases/download/${PLUGINS_VERSION}"
     tmp="$(mktemp -d)"
 
     say "fetching ${name}"

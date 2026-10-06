@@ -193,8 +193,14 @@ fi
 # Rockchip publish it in the rknn-toolkit2 repository rather than as a package. Taken as a direct
 # download of one file at a pinned tag, the same way `setup-gstreamer.sh` takes MPP: one artifact,
 # no third-party apt repository left enabled on a robot.
+#
+# The raw host is a variable for the same reason the rest of `scripts/` takes one: a machine that
+# reaches GitHub only through a mirror must not have this one URL left pointing at the public
+# host. The *repository* is Rockchip's and is not overridable — a mirror that does not carry
+# their tree is not a mirror of this — so only the host moves. Default is the public host, byte
+# for byte.
 
-URL="https://raw.githubusercontent.com/airockchip/rknn-toolkit2/${RUNTIME}/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
+URL="${DUCK_GITHUB_RAW:-https://raw.githubusercontent.com}/airockchip/rknn-toolkit2/${RUNTIME}/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
 
 installed=""
 [ -r "$STAMP" ] && installed=$(cat "$STAMP")

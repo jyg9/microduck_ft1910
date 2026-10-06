@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::Error;
 use crate::manifest::Manifest;
-use crate::source::{FetchedArtifact, ProgressSink, SignedBytes, Source, http};
+use crate::source::{FetchedArtifact, ProgressSink, SignedBytes, Source, http, trim_base};
 
 const SIG_SUFFIX: &str = ".minisig";
 
@@ -27,6 +27,15 @@ pub struct HfHub {
     repo: String,
     revision: String,
     manifest_file: String,
+    /// The Hub host, without a trailing slash.
+    ///
+    /// Configurable for the same reason GitHub's hosts are: a robot that must not reach the
+    /// public service points this at its own mirror. The default lives in `crate::config`,
+    /// so a robot that names nothing sends exactly the URLs it sent before the field
+    /// existed. It covers both the resolve and the refs endpoint because they are one
+    /// service — a mirror that served one and not the other would answer "no manifest" for
+    /// every version, which reads as a withdrawn release rather than as a misconfigured host.
+    endpoint: String,
     client: reqwest::Client,
 }
 
@@ -43,20 +52,23 @@ struct GitRef {
 }
 
 impl HfHub {
-    pub fn new(repo: String, revision: String, manifest_file: String) -> Self {
+    pub fn new(repo: String, revision: String, manifest_file: String, endpoint: String) -> Self {
         Self {
             repo,
             revision,
             manifest_file,
+            endpoint: trim_base(&endpoint),
             client: http::client().unwrap_or_default(),
         }
     }
 
     fn resolve_url(&self, revision: &str, file: &str) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{revision}/{file}",
-            self.repo
-        )
+        format!("{}/{}/resolve/{revision}/{file}", self.endpoint, self.repo)
+    }
+
+    /// The endpoint that answers which tags exist, used to turn a bare 404 into a list.
+    fn refs_url(&self) -> String {
+        format!("{}/api/models/{}/refs", self.endpoint, self.repo)
     }
 
     /// Tag naming convention for an exact version.
@@ -86,7 +98,7 @@ impl HfHub {
     /// Checked so a missing version fails with "no tag v1.2.3 (available: …)" rather
     /// than a bare 404 from the resolve endpoint.
     async fn tag_exists(&self, tag: &str) -> Result<bool, Error> {
-        let url = format!("https://huggingface.co/api/models/{}/refs", self.repo);
+        let url = self.refs_url();
         let bytes = match http::get_bytes(&self.client, &url, None).await {
             Ok(bytes) => bytes,
             // The refs API is a convenience; if it's unavailable, fall through and let
@@ -188,11 +200,15 @@ impl Source for HfHub {
 mod tests {
     use super::*;
 
+    /// The public Hub, as a literal rather than read from `crate::config`'s default — the
+    /// literal is what a robot that configures no endpoint sends, and taking it from the same
+    /// constant would let a typo satisfy both sides.
     fn source() -> HfHub {
         HfHub::new(
             "ORG/gait-model".into(),
             "main".into(),
             "manifest.json".into(),
+            "https://huggingface.co".into(),
         )
     }
 
@@ -201,6 +217,49 @@ mod tests {
         assert_eq!(
             source().resolve_url("main", "manifest.json"),
             "https://huggingface.co/ORG/gait-model/resolve/main/manifest.json"
+        );
+    }
+
+    /// **A configured Hub host is where both requests go.**
+    ///
+    /// Two endpoints, one field: a mirror that were used for the resolve but not for the refs
+    /// lookup would answer "has no tag v1.2.3 (available: …)" for a version that is there —
+    /// which reads as a withdrawn release and sends somebody to the wrong repository.
+    #[test]
+    fn a_configured_endpoint_replaces_the_public_one_in_both_urls() {
+        let hub = HfHub::new(
+            "ORG/gait-model".into(),
+            "main".into(),
+            "manifest.json".into(),
+            "https://hub.internal".into(),
+        );
+        assert_eq!(
+            hub.resolve_url("main", "manifest.json"),
+            "https://hub.internal/ORG/gait-model/resolve/main/manifest.json"
+        );
+        assert_eq!(
+            hub.refs_url(),
+            "https://hub.internal/api/models/ORG/gait-model/refs"
+        );
+    }
+
+    /// The trailing-slash case, for the reason `source::trim_base` gives: a doubled slash is
+    /// a different path, and the only symptom is "no manifest for version …".
+    #[test]
+    fn a_trailing_slash_on_the_endpoint_is_not_doubled() {
+        let hub = HfHub::new(
+            "ORG/gait-model".into(),
+            "main".into(),
+            "manifest.json".into(),
+            "https://hub.internal/".into(),
+        );
+        assert_eq!(
+            hub.resolve_url("main", "m.json"),
+            "https://hub.internal/ORG/gait-model/resolve/main/m.json"
+        );
+        assert_eq!(
+            hub.refs_url(),
+            "https://hub.internal/api/models/ORG/gait-model/refs"
         );
     }
 

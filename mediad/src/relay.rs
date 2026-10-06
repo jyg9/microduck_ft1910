@@ -89,6 +89,16 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 /// The Space the mini's fleet already registers against. §4.
+///
+/// **A default, not a fact about this robot.** It is what `--rendezvous-url` falls back to and
+/// what `DUCK_RENDEZVOUS_URL` overrides, in that order of precedence (`main.rs`). A deployment
+/// that runs its own rendezvous — or that must not talk to this one at all, in which case the
+/// shipped unit passes `--no-remote` — says so there rather than here, because this constant
+/// lives in a binary an update replaces.
+///
+/// Note what registering does *not* require: a token. A robot with no account is inert rather
+/// than anonymous — `Relay::run` sees no token, publishes `SignedOut`, and polls a local file
+/// every thirty seconds. So this URL is only ever contacted by a robot somebody has signed in.
 pub const DEFAULT_RENDEZVOUS: &str = "https://pollen-robotics-reachy-mini-central.hf.space";
 
 /// Where `updaterd` keeps the account credential.
