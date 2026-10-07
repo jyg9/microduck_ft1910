@@ -246,6 +246,26 @@ pub struct PolicyPaths {
     pub skills: Vec<PathBuf>,
 }
 
+/// The servo gains a policy says it was trained against.
+///
+/// Not every export carries them. The XL330 policies predate the field and have none, and a model
+/// without them is one this comparison cannot speak about rather than a broken one — refusing
+/// those would refuse every policy that works on the robot today.
+///
+/// The numbers are in the servo's own register units, which is the whole reason they are worth
+/// reading: `kp_fw` is the same quantity the SCS bus writes on every bring-up, so the two are
+/// directly comparable. A policy trained at 6 and deployed at 32 is not a config error from the
+/// outside — the robot runs, and it is simply a different stiffness from the plant its gait was
+/// fitted to, which reads as "needs tuning" rather than "wrong plant".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrainedGains {
+    pub kp_fw: u8,
+    pub kd_fw: u8,
+    /// Stamped by one fork; neither the XL330 export nor ours writes it. Compared when present,
+    /// because a jaw trained at one P and written with another closes on a different force.
+    pub mouth_kp_fw: Option<u8>,
+}
+
 /// The loaded networks.
 ///
 /// A configured path that fails to load fails the whole load — the policies ship inside the
@@ -378,6 +398,49 @@ impl Policy {
         .home_pose
     }
 
+    /// Every loaded network, in the order they are considered.
+    fn networks(&self) -> impl Iterator<Item = &Network> {
+        std::iter::once(&self.walk)
+            .chain(self.stand.iter())
+            .chain(self.sitstand.iter())
+            .chain(self.ground_pick.iter())
+            .chain(self.skills.iter())
+    }
+
+    /// The plant the loaded set declares, or `None` if none of it declares one.
+    pub fn declared_gains(&self) -> Result<Option<TrainedGains>, PolicyError> {
+        Ok(self.declared()?.map(|(_, gains)| gains))
+    }
+
+    /// The plant the loaded set declares, and the file that named it.
+    fn declared(&self) -> Result<Option<(&Path, TrainedGains)>, PolicyError> {
+        declare_set(
+            self.networks()
+                .map(|network| (network.path.as_path(), network.gains)),
+        )
+    }
+
+    /// The mismatch between the declared plant and the gains the servos are written with.
+    ///
+    /// `Ok(None)` when they agree, and also when nothing declares a plant: an XL330 policy carries
+    /// no `kp_fw`, and refusing those would refuse every policy that works on the robot today.
+    ///
+    /// The returned error is ready to be *returned* or *logged* — that choice is the caller's,
+    /// because running one set on a deliberately different plant is a legitimate bench A/B and an
+    /// operator who has said so should not have to fight the daemon to do it.
+    pub fn gain_mismatch(&self, written: TrainedGains) -> Result<Option<PolicyError>, PolicyError> {
+        let Some((path, declared)) = self.declared()? else {
+            return Ok(None);
+        };
+        Ok(
+            gains_mismatch(declared, written).map(|why| PolicyError::Metadata {
+                path: path.to_owned(),
+                field: "kp_fw",
+                why,
+            }),
+        )
+    }
+
     pub fn infer(
         &mut self,
         observation: &Observation,
@@ -502,6 +565,8 @@ struct Network {
     /// The pose this model's actions are centred on, and the pose its observation's `joint_pos`
     /// block is measured from. See [`parse_home_pose`].
     home_pose: [f64; NUM_JOINTS],
+    /// The plant this model was trained against, when its export says. See [`TrainedGains`].
+    gains: Option<TrainedGains>,
 }
 
 struct LstmState {
@@ -721,6 +786,124 @@ fn parse_home_pose(
     Ok(out)
 }
 
+/// Parse the plant a model declares, out of its export metadata.
+///
+/// Absent means absent, and `None` is the answer for a model that says nothing about the plant —
+/// an XL330 policy is not a policy trained at P=0. *Half* present is an error rather than a
+/// default: an export that stamps P and not D is a bug in whoever wrote it, and filling in the
+/// missing half is how the comparison quietly stops comparing anything.
+fn parse_trained_gains(
+    path: &Path,
+    kp_fw: Option<&str>,
+    kd_fw: Option<&str>,
+    mouth_kp_fw: Option<&str>,
+) -> Result<Option<TrainedGains>, PolicyError> {
+    let refuse = |field: &'static str, why: String| PolicyError::Metadata {
+        path: path.to_owned(),
+        field,
+        why,
+    };
+    let (Some(kp), Some(kd)) = (kp_fw, kd_fw) else {
+        if kp_fw.is_none() && kd_fw.is_none() && mouth_kp_fw.is_none() {
+            return Ok(None);
+        }
+        return Err(refuse(
+            if kp_fw.is_none() { "kp_fw" } else { "kd_fw" },
+            format!(
+                "is missing while the other is present (kp_fw={kp_fw:?}, kd_fw={kd_fw:?}); a \
+                 half-stamped plant cannot be compared against the servos"
+            ),
+        ));
+    };
+
+    // 0 is not a soft joint, it is an open loop — the runtime's own profile floors at 1 for the
+    // same reason — and anything above 255 does not fit the register being compared against.
+    let gain = |field: &'static str, raw: &str| -> Result<u8, PolicyError> {
+        let value: u32 = raw
+            .trim()
+            .parse()
+            .map_err(|e| refuse(field, format!("is not a number: {raw:?} ({e})")))?;
+        if !(1..=255).contains(&value) {
+            return Err(refuse(
+                field,
+                format!("is {value}, outside the 1..=255 a servo register holds"),
+            ));
+        }
+        Ok(value as u8)
+    };
+    Ok(Some(TrainedGains {
+        kp_fw: gain("kp_fw", kp)?,
+        kd_fw: gain("kd_fw", kd)?,
+        mouth_kp_fw: mouth_kp_fw
+            .map(|raw| gain("mouth_kp_fw", raw))
+            .transpose()?,
+    }))
+}
+
+/// The one plant a set declares, or the error naming the two files that disagree.
+///
+/// Free rather than a method so it is testable without ONNX Runtime — the same reason
+/// [`parse_trained_gains`] is, and the disagreement is the case a board would otherwise report as
+/// a gait that is wrong in two directions.
+fn declare_set<'a>(
+    networks: impl Iterator<Item = (&'a Path, Option<TrainedGains>)>,
+) -> Result<Option<(&'a Path, TrainedGains)>, PolicyError> {
+    let mut declared: Option<(&Path, TrainedGains)> = None;
+    for (path, gains) in networks {
+        let Some(gains) = gains else {
+            continue;
+        };
+        match declared {
+            None => declared = Some((path, gains)),
+            Some((_, known)) if known == gains => {}
+            Some((first, known)) => {
+                return Err(PolicyError::Metadata {
+                    path: path.to_owned(),
+                    field: "kp_fw",
+                    why: format!(
+                        "declares P={}/D={} where {} declares P={}/D={}; one robot has one pair \
+                         of servo registers, so this set is not one robot's",
+                        gains.kp_fw,
+                        gains.kd_fw,
+                        first.display(),
+                        known.kp_fw,
+                        known.kd_fw,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(declared)
+}
+
+/// What is wrong with running a policy trained for `declared` on `written`, or `None`.
+///
+/// Free for the same reason as [`declare_set`]: this sentence is the entire output of the check,
+/// and it should be assertable without a policy file or a runtime.
+fn gains_mismatch(declared: TrainedGains, written: TrainedGains) -> Option<String> {
+    let mouth_differs = declared
+        .mouth_kp_fw
+        .is_some_and(|mouth| written.mouth_kp_fw != Some(mouth));
+    if declared.kp_fw == written.kp_fw && declared.kd_fw == written.kd_fw && !mouth_differs {
+        return None;
+    }
+    let show = |value: Option<u8>| value.map_or_else(|| "unset".to_string(), |v| v.to_string());
+    let mouth = if mouth_differs {
+        format!(
+            ", and a mouth P of {} against {}",
+            show(declared.mouth_kp_fw),
+            show(written.mouth_kp_fw)
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "declares P={}/D={} but the servos are written with P={}/D={}{mouth}; the gait was fitted \
+         to the first plant and the robot would run the second",
+        declared.kp_fw, declared.kd_fw, written.kp_fw, written.kd_fw,
+    ))
+}
+
 fn open(path: &Path) -> Result<Network, PolicyError> {
     let bytes = std::fs::read(path).map_err(|source| PolicyError::Read {
         path: path.to_owned(),
@@ -819,18 +1002,26 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
         None
     };
     // Read before the session is moved into the struct, and read as strings: `ort` hands back the
-    // export's own text, so the parsing and its refusals live in `parse_home_pose` where they can be
-    // tested without ONNX Runtime at all.
-    let home_pose = {
+    // export's own text, so the parsing and its refusals live in `parse_home_pose` /
+    // `parse_trained_gains` where they can be tested without ONNX Runtime at all.
+    let (home_pose, gains) = {
         let metadata = session.metadata().map_err(|source| PolicyError::Load {
             path: path.to_owned(),
             source,
         })?;
-        parse_home_pose(
-            path,
-            metadata.custom("default_joint_pos").as_deref(),
-            metadata.custom("joint_names").as_deref(),
-        )?
+        (
+            parse_home_pose(
+                path,
+                metadata.custom("default_joint_pos").as_deref(),
+                metadata.custom("joint_names").as_deref(),
+            )?,
+            parse_trained_gains(
+                path,
+                metadata.custom("kp_fw").as_deref(),
+                metadata.custom("kd_fw").as_deref(),
+                metadata.custom("mouth_kp_fw").as_deref(),
+            )?,
+        )
     };
 
     Ok(Network {
@@ -840,6 +1031,7 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
         path: path.to_owned(),
         digest,
         home_pose,
+        gains,
     })
 }
 
@@ -961,6 +1153,149 @@ head_pitch,head_yaw,head_roll,right_hip_yaw,right_hip_roll,right_hip_pitch,right
         assert!(err.to_string().contains("default_joint_pos"), "{err}");
         let words = "hips,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0";
         assert!(parse_home_pose(path, Some(words), Some(NAMES)).is_err());
+    }
+
+    /// Absent is not zero. An XL330 export has no `kp_fw` at all, and reading that as "trained at
+    /// P=0" would refuse every policy that works on the robot today.
+    #[test]
+    fn a_model_that_names_no_plant_declares_none() {
+        let path = Path::new("/p/x.onnx");
+        assert_eq!(parse_trained_gains(path, None, None, None).unwrap(), None);
+    }
+
+    /// A half-stamped plant cannot be compared, so it is refused rather than completed by guess.
+    #[test]
+    fn a_half_stamped_plant_is_refused() {
+        let path = Path::new("/p/x.onnx");
+        let err = parse_trained_gains(path, Some("6"), None, None).unwrap_err();
+        assert!(err.to_string().contains("kd_fw"), "{err}");
+        let err = parse_trained_gains(path, None, Some("20"), None).unwrap_err();
+        assert!(err.to_string().contains("kp_fw"), "{err}");
+        // A mouth P alone is still a claim about the plant.
+        assert!(parse_trained_gains(path, None, None, Some("10")).is_err());
+    }
+
+    /// Every unusable number, refused rather than clamped into a plant nobody chose.
+    #[test]
+    fn a_plant_outside_the_servo_register_is_refused() {
+        let path = Path::new("/p/x.onnx");
+        // 0 is an open loop rather than a soft joint, and 256 does not fit the register.
+        for bad in ["0", "256", "-1", "6.0", "six", ""] {
+            assert!(
+                parse_trained_gains(path, Some(bad), Some("20"), None).is_err(),
+                "{bad:?} was accepted as a P"
+            );
+        }
+        assert!(parse_trained_gains(path, Some("6"), Some("999"), None).is_err());
+    }
+
+    /// The shape the FT1910 export and the 1910 forks actually write.
+    #[test]
+    fn the_stamped_plant_parses() {
+        let path = Path::new("/p/x.onnx");
+        let gains = parse_trained_gains(path, Some("6"), Some("20"), None)
+            .unwrap()
+            .expect("a stamped plant");
+        assert_eq!(
+            gains,
+            TrainedGains {
+                kp_fw: 6,
+                kd_fw: 20,
+                mouth_kp_fw: None
+            }
+        );
+        let with_mouth = parse_trained_gains(path, Some("6"), Some("20"), Some("10"))
+            .unwrap()
+            .expect("a stamped plant");
+        assert_eq!(with_mouth.mouth_kp_fw, Some(10));
+        // Whitespace is what a text-format exporter leaves behind, not a different number.
+        assert_eq!(
+            parse_trained_gains(path, Some(" 6 "), Some("20"), None).unwrap(),
+            Some(gains)
+        );
+    }
+
+    /// Two files naming two plants are one robot's set only if the robot has two sets of registers.
+    #[test]
+    fn a_set_that_names_two_plants_is_refused_with_both() {
+        let a = Path::new("/p/velstand.onnx");
+        let b = Path::new("/p/roulade.onnx");
+        let six = TrainedGains {
+            kp_fw: 6,
+            kd_fw: 20,
+            mouth_kp_fw: None,
+        };
+        let thirty_two = TrainedGains {
+            kp_fw: 32,
+            kd_fw: 40,
+            mouth_kp_fw: None,
+        };
+
+        assert_eq!(
+            declare_set([(a, Some(six)), (b, None)].into_iter()).unwrap(),
+            Some((a, six)),
+            "a network that says nothing does not outvote one that speaks"
+        );
+        assert_eq!(
+            declare_set([(a, None), (b, None)].into_iter()).unwrap(),
+            None
+        );
+
+        let err = declare_set([(a, Some(six)), (b, Some(thirty_two))].into_iter()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains('6') && text.contains("32"), "{text}");
+        assert!(
+            text.contains("roulade.onnx"),
+            "names the second file: {text}"
+        );
+        assert!(
+            text.contains("velstand.onnx"),
+            "names the first file: {text}"
+        );
+    }
+
+    /// The sentence is the whole output of the check, so what it says is the thing to test.
+    #[test]
+    fn a_mismatch_names_both_plants_and_agreement_is_silent() {
+        let six = TrainedGains {
+            kp_fw: 6,
+            kd_fw: 20,
+            mouth_kp_fw: None,
+        };
+        assert_eq!(gains_mismatch(six, six), None);
+
+        let thirty_two = TrainedGains {
+            kp_fw: 32,
+            kd_fw: 40,
+            mouth_kp_fw: None,
+        };
+        let why = gains_mismatch(six, thirty_two).expect("a mismatch");
+        assert!(why.contains("P=6/D=20"), "{why}");
+        assert!(why.contains("P=32/D=40"), "{why}");
+
+        // D alone is a mismatch. BAM simulates no D term at all, so this is the one comparison
+        // that catches a profile drifting to another D — nothing on the robot would show it.
+        let other_d = TrainedGains {
+            kp_fw: 6,
+            kd_fw: 40,
+            mouth_kp_fw: None,
+        };
+        assert!(gains_mismatch(six, other_d).is_some());
+
+        // The mouth counts only when the export claimed one.
+        let mouth_ten = TrainedGains {
+            kp_fw: 6,
+            kd_fw: 20,
+            mouth_kp_fw: Some(10),
+        };
+        let mouth_five = TrainedGains {
+            kp_fw: 6,
+            kd_fw: 20,
+            mouth_kp_fw: Some(5),
+        };
+        assert_eq!(gains_mismatch(six, mouth_ten), None, "nothing was claimed");
+        let why = gains_mismatch(mouth_ten, mouth_five).expect("a mouth mismatch");
+        assert!(why.contains("mouth P of 10 against 5"), "{why}");
     }
 
     /// The threshold decides walking versus standing every tick, so it must match what the

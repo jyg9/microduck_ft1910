@@ -1080,6 +1080,18 @@ pub struct PolicyParams {
     /// Default true: switching is the prototype's behaviour, and `mode` in the file still chooses
     /// what a reboot comes back in, which is the part that keeps working when this is off.
     pub mode_switch: bool,
+    /// Whether a policy whose declared servo gains disagree with the ones the bus writes may
+    /// still load.
+    ///
+    /// The gains a policy was trained against are stamped into its ONNX (`kp_fw`/`kd_fw`), and the
+    /// same numbers are written to the servos on every bring-up. When they differ the robot is not
+    /// misconfigured in any way an operator can see — it walks, and it is a different stiffness
+    /// from the plant its gait was fitted to, which presents as a gait that "needs tuning". That
+    /// is why the daemon refuses instead: a silent mismatch is the one failure nobody diagnoses.
+    ///
+    /// Default false. Set true to run one set on a deliberately different plant — a bench A/B
+    /// where the mismatch *is* the experiment — and the daemon logs it at warn instead.
+    pub allow_gain_mismatch: bool,
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
     /// release. The literal `"none"` disables a slot outright — the prototype's convention.
@@ -1977,6 +1989,7 @@ impl Default for PolicyParams {
             enabled: true,
             mode: Mode::Walk,
             mode_switch: true,
+            allow_gain_mismatch: false,
             walk: None,
             stand: None,
             sitstand: None,

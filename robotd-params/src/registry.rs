@@ -182,6 +182,12 @@ pub const REGISTRY: &[Entry] = &[
         "Allow the live walk/roller switch. Off pins the robot to `policy.mode` and refuses \
          `robot.setMode` — for a robot whose other mode's policies are not ready",
     ),
+    feature(
+        "policy.allow_gain_mismatch",
+        Kind::Bool,
+        "Load a policy whose stamped `kp_fw`/`kd_fw` disagree with the gains the bus writes. \
+         Off refuses it, because the mismatch is a plant nobody chose and it looks like tuning",
+    ),
     entry(
         "policy.skill",
         Kind::Table,
@@ -747,6 +753,7 @@ mod tests {
                 "policy.enabled",
                 "policy.mode",
                 "policy.mode_switch",
+                "policy.allow_gain_mismatch",
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
